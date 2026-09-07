@@ -44,6 +44,8 @@ for patient in tqdm(dicom_files, desc="Converting DICOM to NIfTI"):
 
         # Convert DICOM to NIfTI
         if modality == "RT-STRUCT-PET-PSMA-PROSTATA":
+            #The segmentations are stored in a RTstruct file and they are directly
+            #mapped on top ofthe PET-PSMA-PROSTATA scan. 
             pet_path = os.path.join(patient_folder, "PETMR-WB-PSMA", "PET-PSMA-PROSTATA")
             rtstruct_path = os.path.join(scan_folder, sorted(os.listdir(scan_folder))[2])
             convert_rtstruct(pet_path, rtstruct_path, f"{patient}_{modality}_study_{study_id}_", patient_output_folder)
