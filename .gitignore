@@ -1,5 +1,6 @@
 .venv/
+.vscode/
 DCM/
-testing_images/
+Data/
 converted_nii_images/
 resampled_images/
