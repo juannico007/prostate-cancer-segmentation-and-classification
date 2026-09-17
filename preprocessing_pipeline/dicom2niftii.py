@@ -12,7 +12,7 @@ ADC-10-6-MM-S, AX-T2-FRFSE, AX-T2-FRFSE-SEN, PET-PSMA-PROSTATA,
 RT-STRUCT-PER-PSMA-PROSTATA, SEGMENTATION-AX-T2-FRFSE-SEN
 Which are the 6 series extracted from hermes"""
 
-input_folder = "Reloads"  
+input_folder = "testing_images"  
 output_folder = "converted_nii_images"
 subfolder = "PETMR-WB-PSMA"
 
