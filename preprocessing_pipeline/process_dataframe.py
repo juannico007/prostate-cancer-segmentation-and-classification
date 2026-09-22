@@ -90,7 +90,7 @@ lesion_data.sort_values(by=["Record ID", "lesion_id"], inplace = True)
 final_data = pd.merge(patient_data, lesion_data, on="Record ID")
 
 #Format names of columns and values
-data_mapper = {"Record ID": "ID",
+data_mapper = {"Record ID": "study_id",
                "Patient alder ved inklusion": "Age",
                "PSA ved skanning": "PSA_level",
                "Prostata volumen": "Prostata_volume",
