@@ -77,14 +77,14 @@ lesion_3_data.rename(columns = lesion_3_data_mapper, inplace = True)
 lesion_4_data.rename(columns = lesion_4_data_mapper, inplace = True)
 
 #Add the number of the lesion to be able to map it
-lesion_1_data[["number of lesion"]] = 1
-lesion_2_data[["number of lesion"]] = 2
-lesion_3_data[["number of lesion"]] = 3
-lesion_4_data[["number of lesion"]] = 4
+lesion_1_data[["lesion_id"]] = 1
+lesion_2_data[["lesion_id"]] = 2
+lesion_3_data[["lesion_id"]] = 3
+lesion_4_data[["lesion_id"]] = 4
 
 #Concat everything
 lesion_data = pd.concat([lesion_1_data, lesion_2_data, lesion_3_data, lesion_4_data])
-lesion_data.sort_values(by=["Record ID", "number of lesion"], inplace = True)
+lesion_data.sort_values(by=["Record ID", "lesion_id"], inplace = True)
 
 #Merge the data
 final_data = pd.merge(patient_data, lesion_data, on="Record ID")
