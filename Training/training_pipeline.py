@@ -210,8 +210,6 @@ class TrainingPipeline:
 
         if records is None:
             records = load_patch_records(Path(data_csv))
-        print("recordsssss", type(records))
-        print(records)
         if not records:
             raise ValueError(f"No patch records found in {data_csv}")
 
@@ -221,12 +219,6 @@ class TrainingPipeline:
         train_series = set(rng.choice(series_ids, size=keep_count, replace=False))
         train_records = [r for r in records if r.series_id in train_series]
         val_records = [r for r in records if r.series_id not in train_series]
-
-        print("Train samples:")
-        print(train_records, len(train_records))
-
-        print("Val samples:")
-        print(val_records, len(val_records))
         #For now we won't add data augmentation, but it will come as a TODO
 
         train_dataset = ProstateDataset(
