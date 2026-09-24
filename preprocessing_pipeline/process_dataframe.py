@@ -14,12 +14,12 @@ from pathlib import Path
 def get_bbox(study_id, lesion_id):
     lesion_image_path = Path(os.path.join(f"Data/resampled_images/{study_id}", f"study_{study_id}_Lesion_{lesion_id}.nii.gz"))
     if not lesion_image_path.exists():
-        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+        return "", "", "", "", "", ""
     lesion_image = itk.imread(lesion_image_path)
     mask = itk.GetArrayFromImage(lesion_image)
-    coords = np.array(np.where(mask > 0), dtype=int)
-    z_min, y_min, x_min = coords.min(axis=1)
-    z_max, y_max, x_max = coords.max(axis=1)
+    coords = np.array(np.where(mask > 0))
+    z_min, y_min, x_min = [int(i) for i in coords.min(axis=1)]
+    z_max, y_max, x_max = [int(i) for i in coords.max(axis=1)]
     return x_min, y_min, z_min, x_max, y_max, z_max
 
 data = pd.read_csv("Data/PSMAPETMRBiopsyGuida_DATA_LABELS_2026-09-16_2209Nicolas.csv", delimiter = ";")
@@ -149,4 +149,5 @@ final_data["x_max"] = x_max_arr
 final_data["y_max"] = y_max_arr
 final_data["z_max"] = z_max_arr
 
+print(final_data.head())
 final_data.to_csv("Data/data.csv", index = False)
