@@ -17,7 +17,7 @@ def get_bbox(study_id, lesion_id):
         return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
     lesion_image = itk.imread(lesion_image_path)
     mask = itk.GetArrayFromImage(lesion_image)
-    coords = np.array(np.where(mask > 0))
+    coords = np.array(np.where(mask > 0), dtype=int)
     z_min, y_min, x_min = coords.min(axis=1)
     z_max, y_max, x_max = coords.max(axis=1)
     return x_min, y_min, z_min, x_max, y_max, z_max
