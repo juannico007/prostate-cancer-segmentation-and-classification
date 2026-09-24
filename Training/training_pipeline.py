@@ -1,3 +1,4 @@
+from collections import defaultdict
 import itk
 from torch.nn import utils
 from model import UNet
@@ -51,36 +52,80 @@ class MultiTaskLoss(nn.Module):
         return total_loss
 
 @dataclass
-class Record:
-    series_id: int
+class LesionRecord:
     lesion_id: int
     label: int
+    x_min: int|None
+    y_min: int|None
+    z_min: int|None
+    x_max: int|None
+    y_max: int|None
+    z_max: int|None
 
-def load_patch_records(patch_csv: Path) -> List[Record]:
-    """Load patch metadata from CSV into Record objects."""
-    records: List[Record] = []
-    with patch_csv.open() as f:
+
+@dataclass
+class Record:
+    series_id: int
+    lesions: List[LesionRecord]
+
+def load_records(data_csv: Path) -> List[Record]:
+    """Load metadata from CSV into Record objects."""
+    grouped = defaultdict(list)
+
+    with data_csv.open() as f:
         reader = csv.DictReader(f)
-        required = {"study_id", "PRIMARY", "lesion_id"}
+        required = {"study_id", 
+                    "PRIMARY", 
+                    "lesion_id"}
+        
         missing = required.difference(reader.fieldnames or set())
         if missing:
             raise ValueError(f"Data CSV missing columns: {', '.join(sorted(missing))}")
+        
         for row in reader:
             try:
-                # TODO: Have to modify this to account for multiple labels per patient
-                labels = int(row["PRIMARY"])
-                lesion_ids = int(row["lesion_id"])
+                study_id = int(row["study_id"])
+                lesion_id = int(row["lesion_id"])
+                label = int(row["PRIMARY"])
+                if row["x_min"] != "":
+                    x_min = int(row["x_min"])
+                    y_min = int(row["y_min"])
+                    z_min = int(row["z_min"])
+                    x_max = int(row["x_max"])
+                    y_max = int(row["y_max"])
+                    z_max = int(row["z_max"])
+                else:
+                    x_min = None
+                    y_min = None
+                    z_min = None
+                    x_max = None
+                    y_max = None
+                    z_max = None
+
             except (TypeError, ValueError):
                 # Skip rows that look like headers or malformed entries
                 print(f"[Warning] Skipping malformed row in patient CSV: {row}")
                 continue
-            records.append(
-                Record(
-                    series_id=int(row["study_id"]),
-                    label=labels,
-                    lesion_id=lesion_ids
+
+            grouped[study_id].append(
+                    LesionRecord(
+                        lesion_id=lesion_id,
+                        label=label,
+                        x_min=x_min,
+                        y_min=y_min,
+                        z_min=z_min,
+                        x_max=x_max,
+                        y_max=y_max,
+                        z_max=z_max
+                    )
                 )
+        records = [
+            Record(
+                series_id=study_id,
+                lesions=lesions
             )
+            for study_id, lesions in grouped.items()
+        ]
     return records
 
 class ProstateDataset(Dataset):
@@ -96,27 +141,94 @@ class ProstateDataset(Dataset):
     def __len__(self):
         return len(self.records)
 
-    def _get_volumes(self, patient):        
-        possible_pet_image_path = Path(os.path.join(self.nii_path, patient)).rglob("*PET-PSMA-PROSTATA_study*.nii.gz")
-        pet_image_path = next(p for p in possible_pet_image_path
-                                if "Lesion" not in p.name)
-        mri_image_path = next(Path(os.path.join(self.nii_path, patient)).rglob("*MRI-PROSTATA_study*.nii.gz"), None)
+    def _get_volumes(self, patient_path):        
+        pet_image_path = next(patient_path.rglob("*PET.nii.gz"))
+
+        mri_image_path = next(patient_path.rglob("*MRI_T2.nii.gz"))
+
         pet_image = itk.array_from_image(itk.imread(pet_image_path))
         mri_image = itk.array_from_image(itk.imread(mri_image_path))
 
-        lesion_image_paths = list(Path(os.path.join(self.nii_path, patient)).rglob("*Lesion*.nii.gz"))
-        lesions = []
-        for lesion in lesion_image_paths:
-            lesion_image = itk.array_from_image(itk.imread(lesion))
-            lesions.append(lesion_image)
-        lesion_masks = np.stack(lesions, axis=3) if lesions else [np.zeros_like(pet_image)]
-        return pet_image, mri_image, lesion_masks
+        return pet_image, mri_image
+
+    def _get_lesion_mask(self, patient_path, lesion_id):
+        lesion_paths = list(
+            patient_path.rglob(f"*Lesion_{lesion_id}.nii.gz")
+        )
+
+        if len(lesion_paths) != 1:
+            raise ValueError(
+                f"Expected exactly one mask for lesion {lesion_id}, "
+                f"found {len(lesion_paths)}"
+            )
+
+        mask = itk.array_from_image(
+            itk.imread(lesion_paths[0])
+        )
+
+        return mask
 
     def __getitem__(self, idx):
         record = self.records[idx]
-        pet_volume, mri_volume, lesion_masks = self._get_volumes()
+        patient = str(record.series_id)
 
-        return mri_volume, pet_volume, lesion_masks, record.labels
+        patient_path = Path(self.nii_path) / patient
+
+        pet_volume, mri_volume = self._get_volumes(patient_path)
+
+        targets = []
+
+        for lesion in record.lesions:
+
+            #Checks if the segmentation exists, it does it by looking at the
+            #coordinates of the bounding box, as the coordinates were taken from it
+            has_bbox = all(
+                value is not None
+                for value in (
+                    lesion.x_min,
+                    lesion.y_min,
+                    lesion.z_min,
+                    lesion.x_max,
+                    lesion.y_max,
+                    lesion.z_max,
+                )
+            )
+            if has_bbox:
+                mask = self._get_lesion_mask(
+                    patient_path,
+                    lesion.lesion_id
+                )
+            else:
+                mask = None
+
+            targets.append({
+                "lesion_id": lesion.lesion_id,
+                "label": lesion.label,
+                "mask": mask,
+                "bbox": np.array([
+                    lesion.x_min,
+                    lesion.y_min,
+                    lesion.z_min,
+                    lesion.x_max,
+                    lesion.y_max,
+                    lesion.z_max
+                ]) if has_bbox else None,
+            })
+
+        return {
+            "patient_id": record.series_id,
+            "mri": mri_volume,
+            "pet": pet_volume,
+            "targets": targets,
+        }
+
+def collate_fn(batch):
+    return {
+        "patient_id": [item["patient_id"] for item in batch],
+        "mri": torch.stack([item["mri"] for item in batch]),
+        "pet": torch.stack([item["pet"] for item in batch]),
+        "targets": [item["targets"] for item in batch],
+    }
 
 class TrainingPipeline:
     """Training pipeline for the prostate cancer classification model."""
@@ -209,7 +321,7 @@ class TrainingPipeline:
         split_seed = split_seed if split_seed is not None else self.split_seed
 
         if records is None:
-            records = load_patch_records(Path(data_csv))
+            records = load_records(Path(data_csv))
         if not records:
             raise ValueError(f"No patch records found in {data_csv}")
 
