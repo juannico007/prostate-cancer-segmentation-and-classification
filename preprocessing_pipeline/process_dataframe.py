@@ -3,14 +3,24 @@ This file is in charge of preprocessing the csv file provided by the medical tea
 It filters the necessary columns from it and formats the column structure of multiple lesions into 
 a row structure where each one of the lesions corresponds to one row.
 
-Creation date:
-22/09/2026
-
-Last modification:
-22/09/2026
+It also adds the bounding box information per each one of the lesions
 """
-
+import itk
+import numpy as np
+import os
 import pandas as pd
+from pathlib import Path
+
+def get_bbox(study_id, lesion_id):
+    lesion_image_path = Path(os.path.join(f"Data/resampled_images/{study_id}", f"study_{study_id}_Lesion_{lesion_id}.nii.gz"))
+    if not lesion_image_path.exists():
+        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+    lesion_image = itk.imread(lesion_image_path)
+    mask = itk.GetArrayFromImage(lesion_image)
+    coords = np.array(np.where(mask > 0))
+    z_min, y_min, x_min = coords.min(axis=1)
+    z_max, y_max, x_max = coords.max(axis=1)
+    return x_min, y_min, z_min, x_max, y_max, z_max
 
 data = pd.read_csv("Data/PSMAPETMRBiopsyGuida_DATA_LABELS_2026-09-16_2209Nicolas.csv", delimiter = ";")
 
@@ -112,5 +122,31 @@ final_data["Transitional"] = final_data["Transitional"].map({"Checked": 1, "Unch
 final_data["Side"] = final_data["Side"].map({"højre": 0, "venstre": 1, "midt": 2, "begge": 3})
 final_data['Earlier_MRI_finding_PIRADS'] = final_data['Earlier_MRI_finding_PIRADS'].map(lambda x: x.lstrip('PIRADS '))
 final_data['PRIMARY'] = final_data['PRIMARY'].map(lambda x: x.lstrip('PRIMARY '))
+
+#Now we need to add the information about the bounding boxes for the 
+#network to do their detections
+
+x_min_arr = []
+x_max_arr = []
+y_min_arr = []
+y_max_arr = []
+z_min_arr = []
+z_max_arr = []
+
+for index, row in final_data.iterrows():
+    x_min, y_min, z_min, x_max, y_max, z_max = get_bbox(str(row[0]), row[-1])
+    x_min_arr.append(x_min)
+    y_min_arr.append(y_min)
+    z_min_arr.append(z_min)
+    x_max_arr.append(x_max)
+    y_max_arr.append(y_max)
+    z_max_arr.append(z_max)
+
+final_data["x_min"] = x_min_arr
+final_data["y_min"] = y_min_arr
+final_data["z_min"] = z_min_arr
+final_data["x_max"] = x_max_arr
+final_data["y_max"] = y_max_arr
+final_data["z_max"] = z_max_arr
 
 final_data.to_csv("Data/data.csv", index = False)
