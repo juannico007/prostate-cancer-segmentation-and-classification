@@ -118,11 +118,9 @@ def process_patient_nifti(patient_folder, output_folder, target_size = None):
 
     folder = Path(patient_folder)
     #This regular expression includes the lesions as well so we need to filter them out afterwards.
-    possible_pet_image_path = folder.rglob("*PET-PSMA-PROSTATA_study*.nii.gz")
-    pet_image_path = next(p for p in possible_pet_image_path
-                          if "Lesion" not in p.name)
+    pet_image_path = next(folder.rglob("*PET.nii.gz"))
     
-    mri_image_path = next(folder.rglob("*AX-T2-FRFSE*.nii.gz"), None)
+    mri_image_path = next(folder.rglob("*MRI_T2.nii.gz"), None)
     lesion_image_paths = list(folder.rglob("*Lesion*.nii.gz"))
     print(lesion_image_paths)
     if not lesion_image_paths:
@@ -158,9 +156,9 @@ def process_patient_nifti(patient_folder, output_folder, target_size = None):
             itk.imwrite(lesion_resampled, output_lesion_path)
 
         
-for patient in tqdm(os.listdir("converted_nii_images")):
-    patient_folder = os.path.join("converted_nii_images", patient)
-    output_folder = os.path.join("resampled_images", patient)
+for patient in tqdm(os.listdir("Data/converted_nii_images")):
+    patient_folder = os.path.join("Data/converted_nii_images", patient)
+    output_folder = os.path.join("Data/resampled_images", patient)
     print("processing patient: ", patient)
     process_patient_nifti(patient_folder, output_folder, target_size=(128, 128, 128))
     print()
