@@ -52,7 +52,8 @@ class MultiTaskLoss(nn.Module):
 
 @dataclass
 class Record:
-    series_id: str
+    series_id: int
+    lesion_id: int
     label: int
 
 def load_patch_records(patch_csv: Path) -> List[Record]:
@@ -60,22 +61,24 @@ def load_patch_records(patch_csv: Path) -> List[Record]:
     records: List[Record] = []
     with patch_csv.open() as f:
         reader = csv.DictReader(f)
-        required = {"series_id", "labels"}
+        required = {"study_id", "PRIMARY", "lesion_id"}
         missing = required.difference(reader.fieldnames or set())
         if missing:
-            raise ValueError(f"Patches CSV missing columns: {', '.join(sorted(missing))}")
+            raise ValueError(f"Data CSV missing columns: {', '.join(sorted(missing))}")
         for row in reader:
             try:
                 # TODO: Have to modify this to account for multiple labels per patient
-                labels = int(row["labels "])
+                labels = int(row["PRIMARY"])
+                lesion_ids = int(row["lesion_id"])
             except (TypeError, ValueError):
                 # Skip rows that look like headers or malformed entries
-                print(f"[Warning] Skipping malformed row in patches CSV: {row}")
+                print(f"[Warning] Skipping malformed row in patient CSV: {row}")
                 continue
             records.append(
                 Record(
-                    series_id=row["series_id"],
-                    labels=labels
+                    series_id=int(row["study_id"]),
+                    label=labels,
+                    lesion_id=lesion_ids
                 )
             )
     return records
@@ -130,7 +133,7 @@ class TrainingPipeline:
         lr_reduction_factor : float = 0.5,
         min_lr : float = 1e-7,
         checkpoint_path: str = "prostate_classification_best.pt",
-        patch_csv: Optional[Path] = None,
+        data_csv: Optional[Path] = None,
         train_ratio: float = 0.8,
         split_seed: int = 42,
         scheduler_config: Optional[Dict[str, Any]] = None,
@@ -161,6 +164,7 @@ class TrainingPipeline:
         self.lr_reduction_patience = lr_reduction_patience
         self.lr_reduction_factor = lr_reduction_factor
         self.min_lr = min_lr
+        self.data_csv = Path(data_csv) if data_csv else None
         self.checkpoint_path = checkpoint_path
         self.train_ratio = train_ratio
         self.split_seed = split_seed
@@ -170,10 +174,6 @@ class TrainingPipeline:
             "gamma": 0.96,
         }
         lw = loss_weights or {}
-        #self.alpha_max = float(lw.get("alpha_max", 0.5))
-        #self.beta = float(lw.get("beta", 2.0))
-        #self.lambda_tail = float(lw.get("lambda_tail", 1.0))
-        #self.lambda_max = float(lw.get("lambda_max", 0.0))
         self.seg_weight = float(lw.get("segmentation", 0.5))
         self.cls_weight = float(lw.get("classification", 1.0))
 
@@ -194,7 +194,7 @@ class TrainingPipeline:
     def create_dataloaders(
         self,
         nii_path: Path,
-        patch_csv: Path,
+        data_csv: Path,
         train_ratio: Optional[float] = None,
         split_seed: Optional[int] = None,
         records: Optional[List[Record]] = None,
@@ -202,29 +202,31 @@ class TrainingPipeline:
         """
         Create PyTorch DataLoaders from patch metadata.
         """
-        if patch_csv is None and records is None and self.patch_csv is None:
-            raise ValueError("patch_csv or records must be provided for patch-based training.")
-        patch_csv = patch_csv or self.patch_csv
+        if data_csv is None and records is None and self.data_csv is None:
+            raise ValueError("data_csv or records must be provided for training.")
+        data_csv = data_csv or self.data_csv
         train_ratio = train_ratio if train_ratio is not None else self.train_ratio
         split_seed = split_seed if split_seed is not None else self.split_seed
 
         if records is None:
-            records = load_patch_records(Path(patch_csv))
+            records = load_patch_records(Path(data_csv))
+        print("recordsssss", type(records))
+        print(records)
         if not records:
-            raise ValueError(f"No patch records found in {patch_csv}")
+            raise ValueError(f"No patch records found in {data_csv}")
 
         rng = np.random.default_rng(split_seed)
-        indices = np.arange(len(records))
-        rng.shuffle(indices)
-        cutoff = int(train_ratio * len(indices))
-        train_idx = indices[:cutoff]
-        val_idx = indices[cutoff:]
+        series_ids = sorted({r.series_id for r in records})
+        keep_count = max(1, int(round(len(series_ids) * train_ratio)))
+        train_series = set(rng.choice(series_ids, size=keep_count, replace=False))
+        train_records = [r for r in records if r.series_id in train_series]
+        val_records = [r for r in records if r.series_id not in train_series]
 
-        train_records = [records[i] for i in train_idx]
-        val_records = [records[i] for i in val_idx]
+        print("Train samples:")
+        print(train_records, len(train_records))
 
-        train_labels = np.array([r.labels for r in train_records], dtype=int)
-
+        print("Val samples:")
+        print(val_records, len(val_records))
         #For now we won't add data augmentation, but it will come as a TODO
 
         train_dataset = ProstateDataset(
