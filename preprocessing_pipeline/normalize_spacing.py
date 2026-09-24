@@ -123,10 +123,6 @@ def process_patient_nifti(patient_folder, output_folder, target_size = None):
     mri_image_path = next(folder.rglob("*MRI_T2.nii.gz"), None)
     lesion_image_paths = list(folder.rglob("*Lesion*.nii.gz"))
     print(lesion_image_paths)
-    if not lesion_image_paths:
-        return
-
-    print("Found lesion for patient: ", patient_folder)
     mri_image_name = PurePath(mri_image_path).name
     pet_image_name = PurePath(pet_image_path).name
     
@@ -147,6 +143,9 @@ def process_patient_nifti(patient_folder, output_folder, target_size = None):
         itk.imwrite(mri_image, output_mri_path)
         itk.imwrite(pet_resampled, output_pet_path)
 
+        if not lesion_image_paths:
+            return
+        print("Found lesions for patient: ", patient_folder)
         for lesion_image_path in lesion_image_paths:
             
             lesion_image_name = PurePath(lesion_image_path).name
@@ -154,8 +153,7 @@ def process_patient_nifti(patient_folder, output_folder, target_size = None):
             lesion_image = itk.imread(lesion_image_path)
             lesion_resampled = resample_mask_to_reference(lesion_image, mri_image)
             itk.imwrite(lesion_resampled, output_lesion_path)
-
-        
+    
 for patient in tqdm(os.listdir("Data/converted_nii_images")):
     patient_folder = os.path.join("Data/converted_nii_images", patient)
     output_folder = os.path.join("Data/resampled_images", patient)
