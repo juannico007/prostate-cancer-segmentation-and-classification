@@ -394,21 +394,6 @@ class ClassifierBlock(nn.Module):
         y = self.fc2(y)
         return y
 
-"""class PatientSeverityHead(nn.Module):
-    def __init__(self, in_channels, hidden_channels, num_severity_levels, dropout):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool3d(1)
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(in_channels, hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_channels, num_severity_levels - 1),
-        )
-
-    def forward(self, features):
-        return self.classifier(self.pool(features))
-"""
 class UNet(nn.Module):
     """
     3D U-Net implementation.
@@ -502,7 +487,8 @@ class UNet(nn.Module):
                                              middle_neurons=self.middle_neurons,
                                              out_neurons=self.num_severity_levels,
                                              drop=self.dropout)
-
+        self.severity_head.initialize_classifier()
+        
         self.down_blocks = nn.ModuleList(self.down_blocks)
         self.up_blocks = nn.ModuleList(self.up_blocks)
 
