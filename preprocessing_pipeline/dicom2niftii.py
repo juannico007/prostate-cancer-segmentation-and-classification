@@ -48,14 +48,17 @@ for patient in tqdm(dicom_files, desc="Converting DICOM to NIfTI"):
         if not os.path.exists(pet_folder):
             pet_folder = os.path.join(patient_folder, subfolder, "E-1-PET-PSMA-PROSTATA")
             if not os.path.exists(pet_folder):
-                print(f"Warning: PET folder '{pet_folder}' does not exist for patient '{patient}'. Skipping.")
-                print()
-                continue    
+                pet_folder = os.path.join(patient_folder, subfolder, "COREG-PET-PSMA-PROSTATA1")
+                if not os.path.exists(pet_folder):
+                    print(f"Warning: PET folder '{pet_folder}' does not exist for patient '{patient}'. Skipping.")
+                    print()
+                    continue    
     print(pet_folder)
     print()
     try:
         data = dcmread(os.path.join(pet_folder, sorted(os.listdir(pet_folder))[0]))
         study_id = data['StudyID'].value
+        print(study_id)
     except Exception as e:
         print(f"Error reading PET data for patient '{patient}': {e}")
         continue
@@ -73,7 +76,7 @@ for patient in tqdm(dicom_files, desc="Converting DICOM to NIfTI"):
 
         # Convert DICOM to NIfTI
         if modality == "RT-STRUCT-PET-PSMA-PROSTATA" or modality == "RT-STRUCT-COREG-E-1-PET-PSMA-PROSTATA-MRJ"\
-            or modality == "RT-STRUCT-COREG-PET-PSMA-PROSTATA1":
+            or modality == "RT-STRUCT-COREG-PET-PSMA-PROSTATA1" or modality == "RT-STRUCT-COREG-PER-PSMA-PROSTATA1":
             print(patient, modality)
             #The segmentations are stored in a RTstruct file and they are directly
             #mapped on top ofthe PET-PSMA-PROSTATA scan.
