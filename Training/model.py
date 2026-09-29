@@ -181,8 +181,6 @@ class GridAttentionBlock(nn.Module):
         y = sigm_psi_f.expand_as(x) * x
         wy = self.W(y)
 
-        self.last_attention = sigm_psi_f
-        
         return wy, sigm_psi_f
     
     def init_weights(self):
@@ -249,15 +247,12 @@ class DownBlock(nn.Module):
             self.norm2 = get_normalization(normalization=self.normalization, num_channels=self.out_channels)
 
     def forward(self, x):
-        self.activations = []
         y = self.conv1(x)
         y = self.act1(y)
-        self.activations.append(y)
         if self.normalization:
             y = self.norm1(y)
         y = self.conv2(y)
         y = self.act2(y)
-        self.activations.append(y)
         if self.normalization:
             y = self.norm2(y)
 
@@ -325,27 +320,24 @@ class UpBlock(nn.Module):
         self.concat = Concatenate()
 
     def forward(self, encoder_layer, decoder_layer):
-        self.activations = []
         up_layer = self.up(decoder_layer)
         cropped_encoder_layer, dec_layer = autocrop(encoder_layer, up_layer)
+        #TODO implement the attention in the forward pass
         gated_encoder, att = self.attention(cropped_encoder_layer, decoder_layer)
 
         if self.up_mode != 'transposed':
             up_layer = self.conv1(up_layer)
         up_layer = self.act1(up_layer)
-        self.activations.append(up_layer)
         if self.normalization:
             up_layer = self.norm1(up_layer)
 
         merged_layer = self.concat(up_layer, gated_encoder)
         y = self.conv2(merged_layer)
         y = self.act2(y)
-        self.activations.append(y)
         if self.normalization:
             y = self.norm2(y)
         y = self.conv3(y)
         y = self.act3(y)
-        self.activations.append(y)
         if self.normalization:
             y = self.norm3(y)
         return y
@@ -393,18 +385,30 @@ class ClassifierBlock(nn.Module):
         nn.init.zeros_(self.fc2.bias)
 
     def forward(self, encoded_features):
-        self.activations = []
         y = self.gap(encoded_features)
         y = y.view(y.size(0), -1)
 
         y = self.fc1(y)
         y = self.act1(y)
-        self.activations.append(y)
         y = self.dropout(y)
         y = self.fc2(y)
-        self.activations.append(y)
         return y
 
+"""class PatientSeverityHead(nn.Module):
+    def __init__(self, in_channels, hidden_channels, num_severity_levels, dropout):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_channels, hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, num_severity_levels - 1),
+        )
+
+    def forward(self, features):
+        return self.classifier(self.pool(features))
+"""
 class UNet(nn.Module):
     """
     3D U-Net implementation.
@@ -426,8 +430,8 @@ class UNet(nn.Module):
     """
     def __init__(
         self,
-        in_channels: int = 1,
-        out_channels: int = 2,
+        in_channels: int = 2,
+        out_channels: int = 4,
         n_blocks: int = 4,
         start_filters: int = 32,
         activation: str = 'relu',
@@ -435,9 +439,9 @@ class UNet(nn.Module):
         conv_mode: str = 'same',
         up_mode: str = 'transposed',
         middle_neurons: int = 256,
-        class_output: int = 1,
         dropout: float = 0,
-        attention: bool = False
+        attention: bool = False,
+        num_severity_levels: int = 5,
     ):
         super().__init__()
 
@@ -450,9 +454,9 @@ class UNet(nn.Module):
         self.conv_mode = conv_mode
         self.up_mode = up_mode
         self.middle_neurons = middle_neurons
-        self.class_outputs = class_output
         self.dropout = dropout
         self.attention = attention
+        self.num_severity_levels = num_severity_levels
 
         self.down_blocks = []
         self.up_blocks = []
@@ -475,16 +479,6 @@ class UNet(nn.Module):
 
             self.down_blocks.append(down_block)
 
-        # Auxiliary classifier
-        if self.middle_neurons:
-            num_channels = self.start_filters * (2 ** (self.n_blocks-1))
-            self.class_block = ClassifierBlock(in_channels=num_channels, 
-                                            out_neurons=self.class_outputs, 
-                                            middle_neurons=self.middle_neurons,
-                                            drop=self.dropout,
-                                            activation=self.activation)
-            self.class_block.initialize_classifier()
-
         # Decoder
         for i in range(n_blocks - 1):
             num_filters_in = num_filters_out
@@ -502,8 +496,12 @@ class UNet(nn.Module):
 
             self.up_blocks.append(up_block)
 
-        # Final convolution
-        self.final_conv = get_conv_layer(num_filters_out, self.out_channels, kernel_size=1, stride=1, padding=0, bias=True)
+        bottleneck_channels = self.start_filters * (2 ** (self.n_blocks - 1))
+        self.segmentation_head = get_conv_layer(num_filters_out, self.out_channels, kernel_size=1, padding=0)
+        self.severity_head = ClassifierBlock(in_channels=bottleneck_channels,
+                                             middle_neurons=self.middle_neurons,
+                                             out_neurons=self.num_severity_levels,
+                                             drop=self.dropout)
 
         self.down_blocks = nn.ModuleList(self.down_blocks)
         self.up_blocks = nn.ModuleList(self.up_blocks)
@@ -535,27 +533,21 @@ class UNet(nn.Module):
             self.weight_init(module, method_weights, **kwargs_weights)
             self.bias_init(module, method_bias, **kwargs_bias)
 
-    def forward(self, x: torch.tensor):
-        self.encoder_output = []
-        self.activations = []
+    def forward(self, x: torch.Tensor):
+        encoder_output = []
         for module in self.down_blocks:
             x, before_pooling = module(x)
-            self.activations += module.activations
-            self.encoder_output.append(before_pooling)
-            
-        if self.middle_neurons:
-            with torch.autocast(device_type='cuda', enabled=False):
-                class_output = self.class_block(x)
-                self.activations += self.class_block.activations
-        else:
-            class_output = torch.tensor([0], device=x.device)
+            encoder_output.append(before_pooling)
+
+        severity_logits = self.severity_head(x)
 
         for i, module in enumerate(self.up_blocks):
-            before_pool = self.encoder_output[-(i + 2)]
+            before_pool = encoder_output[-(i + 2)]
             x = module(before_pool, x)
-            self.activations += module.activations
         
-        x = self.final_conv(x)
-        self.activations.append(x)
+        segmentation_logits = self.segmentation_head(x)
 
-        return x, class_output
+        return {
+            "segmentation_logits": segmentation_logits,
+            "severity_logits": severity_logits,
+        }
