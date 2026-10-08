@@ -6,6 +6,7 @@ from model import UNet
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 import torch.nn as nn
+import torch.nn.functional as F
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -14,42 +15,6 @@ from pathlib import Path
 import csv
 from dataclasses import dataclass
 import os
-
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-5):
-        super(DiceLoss, self).__init__()
-        self.smooth = smooth
-
-    def forward(self, preds, targets):
-        # Apply sigmoid if preds are raw logits
-        preds = torch.sigmoid(preds)
-        
-        # Flatten label and prediction tensors
-        preds = preds.view(-1)
-        targets = targets.view(-1)
-        
-        intersection = (preds * targets).sum()
-        dice_coeff = (2. * intersection + self.smooth) / (preds.sum() + targets.sum() + self.smooth)
-        
-        return 1. - dice_coeff
-
-class MultiTaskLoss(nn.Module):
-    def __init__(self, tasks: List[str]):
-        super().__init__()
-        self.tasks = tasks
-        self.log_vars = nn.ParameterDict({
-            task: nn.Parameter(torch.zeros(1)) for task in tasks
-        })
-
-    def forward(self, loss_dict: Dict[str, torch.Tensor]):
-        total_loss = 0
-        for task, loss in loss_dict.items():
-            if task not in self.log_vars:
-                continue
-            log_var = self.log_vars[task]
-            precision = torch.exp(-log_var)
-            total_loss += 0.5 * precision * loss + 0.5 * log_var
-        return total_loss
 
 @dataclass
 class LesionRecord:
@@ -141,10 +106,26 @@ class ProstateDataset(Dataset):
     def __len__(self):
         return len(self.records)
 
-    def _get_volumes(self, patient_path):        
-        pet_image_path = next(patient_path.rglob("*PET.nii.gz"))
+    @staticmethod
+    def _find_volume_paths(patient_path):
+        pet_image_paths = list(patient_path.rglob("*PET.nii.gz"))
+        mri_image_paths = list(patient_path.rglob("*MRI_T2.nii.gz"))
+        return pet_image_paths, mri_image_paths
 
-        mri_image_path = next(patient_path.rglob("*MRI_T2.nii.gz"))
+    def has_required_volumes(self, record):
+        patient_path = Path(self.nii_path) / str(record.series_id)
+        pet_paths, mri_paths = self._find_volume_paths(patient_path)
+        return len(pet_paths) == 1 and len(mri_paths) == 1
+
+    def _get_volumes(self, patient_path):
+        pet_image_paths, mri_image_paths = self._find_volume_paths(patient_path)
+        if len(pet_image_paths) != 1 or len(mri_image_paths) != 1:
+            raise FileNotFoundError(
+                f"Patient {patient_path.name} requires exactly one PET and one MRI_T2 volume; "
+                f"found {len(pet_image_paths)} PET and {len(mri_image_paths)} MRI_T2 files"
+            )
+        pet_image_path = pet_image_paths[0]
+        mri_image_path = mri_image_paths[0]
 
         pet_image = itk.array_from_image(itk.imread(pet_image_path))
         mri_image = itk.array_from_image(itk.imread(mri_image_path))
@@ -177,6 +158,8 @@ class ProstateDataset(Dataset):
         pet_volume, mri_volume = self._get_volumes(patient_path)
 
         targets = []
+        segmentation_target = np.zeros(mri_volume.shape, dtype=np.int64)
+        segmentation_valid = True
 
         for lesion in record.lesions:
 
@@ -193,25 +176,44 @@ class ProstateDataset(Dataset):
                     lesion.z_max,
                 )
             )
-            if has_bbox:
-                mask = self._get_lesion_mask(
-                    patient_path,
-                    lesion.lesion_id
-                )
+            if has_bbox and lesion.label >= 3:
+                try:
+                    mask = self._get_lesion_mask(
+                        patient_path,
+                        lesion.lesion_id
+                    )
+                except ValueError:
+                    mask = None
             else:
                 mask = None
+
+            if lesion.label >= 3:
+                if mask is None:
+                    segmentation_valid = False
+                else:
+                    mask_array = np.asarray(mask) > 0
+                    if mask_array.shape != mri_volume.shape:
+                        raise ValueError(
+                            f"Patient {patient}: lesion {lesion.lesion_id} mask shape "
+                            f"{mask_array.shape} does not match image shape {mri_volume.shape}"
+                        )
+                    np.maximum(
+                        segmentation_target,
+                        mask_array.astype(np.int64) * (lesion.label - 2),
+                        out=segmentation_target,
+                    )
 
             targets.append({
                 "lesion_id": lesion.lesion_id,
                 "label": lesion.label,
                 "mask": mask,
                 "bbox": np.array([
-                    lesion.x_min,
-                    lesion.y_min,
                     lesion.z_min,
-                    lesion.x_max,
+                    lesion.y_min,
+                    lesion.x_min,
+                    lesion.z_max,
                     lesion.y_max,
-                    lesion.z_max
+                    lesion.x_max,
                 ]) if has_bbox else None,
             })
 
@@ -220,15 +222,41 @@ class ProstateDataset(Dataset):
             "mri": mri_volume,
             "pet": pet_volume,
             "targets": targets,
+            "segmentation": segmentation_target,
+            "segmentation_valid": segmentation_valid,
+            "patient_score": max(lesion.label for lesion in record.lesions),
         }
 
 def collate_fn(batch):
+    mri = torch.stack([
+        torch.from_numpy(item["mri"]).float()
+        for item in batch
+    ])
+
+    pet = torch.stack([
+        torch.from_numpy(item["pet"]).float()
+        for item in batch
+    ])
+
+    x = torch.stack([mri, pet], dim=1)
+    segmentation = torch.stack([
+        torch.from_numpy(item["segmentation"]).long()
+        for item in batch
+    ])
+
     return {
         "patient_id": [item["patient_id"] for item in batch],
-        "mri": torch.stack([item["mri"] for item in batch]),
-        "pet": torch.stack([item["pet"] for item in batch]),
+        "image": x,
         "targets": [item["targets"] for item in batch],
+        "segmentation": segmentation,
+        "segmentation_valid": torch.tensor(
+            [item["segmentation_valid"] for item in batch], dtype=torch.bool
+        ),
+        "patient_score": torch.tensor(
+            [item["patient_score"] for item in batch], dtype=torch.long
+        ),
     }
+
 
 class TrainingPipeline:
     """Training pipeline for the prostate cancer classification model."""
@@ -249,7 +277,10 @@ class TrainingPipeline:
         train_ratio: float = 0.8,
         split_seed: int = 42,
         scheduler_config: Optional[Dict[str, Any]] = None,
-        loss_weights: Optional[Dict[str, float]] = None
+        loss_weights: Optional[Dict[str, float]] = None,
+        mixed_precision: bool = True,
+        gradient_accumulation_steps: int = 1,
+        num_workers: int = 2,
         ):
         """
         Initialize training pipeline.
@@ -280,29 +311,22 @@ class TrainingPipeline:
         self.checkpoint_path = checkpoint_path
         self.train_ratio = train_ratio
         self.split_seed = split_seed
+        self.mixed_precision = mixed_precision
+        self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
+        self.num_workers = max(0, int(num_workers))
         self.scheduler_config = dict(scheduler_config) if scheduler_config else {
             "name": "step",
             "step_size": 100,
             "gamma": 0.96,
         }
         lw = loss_weights or {}
-        self.seg_weight = float(lw.get("segmentation", 0.5))
+        self.seg_weight = float(lw.get("segmentation", 1.0))
         self.cls_weight = float(lw.get("classification", 1.0))
 
         self.scheduler_step_mode: Optional[str] = None
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
         self.scheduler_name: Optional[str] = None
         
-        # Initialize loss function, for segmentation we let it be DICE
-        self.criterion = DiceLoss()
-
-        # Identify active tasks for Multi-Task Learning
-        self.tasks = ["segmentation"]
-        if self.cls_weight > 0:
-            self.tasks.append("classification")
-        
-        self.multi_task_loss = MultiTaskLoss(self.tasks)
-
     def create_dataloaders(
         self,
         nii_path: Path,
@@ -325,13 +349,31 @@ class TrainingPipeline:
         if not records:
             raise ValueError(f"No patch records found in {data_csv}")
 
+        volume_check = ProstateDataset(nii_path=nii_path, records=records)
+
         rng = np.random.default_rng(split_seed)
         series_ids = sorted({r.series_id for r in records})
         keep_count = max(1, int(round(len(series_ids) * train_ratio)))
         train_series = set(rng.choice(series_ids, size=keep_count, replace=False))
         train_records = [r for r in records if r.series_id in train_series]
         val_records = [r for r in records if r.series_id not in train_series]
+        missing_train = [r.series_id for r in train_records if not volume_check.has_required_volumes(r)]
+        missing_val = [r.series_id for r in val_records if not volume_check.has_required_volumes(r)]
+        train_records = [r for r in train_records if r.series_id not in set(missing_train)]
+        val_records = [r for r in val_records if r.series_id not in set(missing_val)]
+        if missing_train or missing_val:
+            print(
+                "[Warning] Excluding studies without exactly one PET and one MRI_T2 volume: "
+                f"train={missing_train}, validation={missing_val}"
+            )
+        if not train_records:
+            raise ValueError("No training studies have both PET and MRI_T2 volumes.")
+        if not val_records:
+            raise ValueError("No validation studies have both PET and MRI_T2 volumes.")
         #For now we won't add data augmentation, but it will come as a TODO
+
+        print("training records:", [i.series_id for i in train_records])
+        print("validation records:", [i.series_id for i in val_records])
 
         train_dataset = ProstateDataset(
             nii_path=nii_path,
@@ -346,15 +388,21 @@ class TrainingPipeline:
             train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=0,
-            pin_memory=True
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
+            collate_fn=collate_fn
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=0,
-            pin_memory=True
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
+            collate_fn=collate_fn
         )
         self.train_loader, self.val_loader = train_loader, val_loader
         return self.train_loader, self.val_loader
@@ -423,353 +471,150 @@ class TrainingPipeline:
         else:
             raise ValueError(f"Unsupported scheduler '{name}'.")
     
-    def train(
-        self,
-    ) -> dict:
-        """Run the training loop using the loaders prepared beforehand."""
-        # # Check if GPU available
-        # if torch.cuda.is_available():
-        #     print("GPU is on")
-        #     self.device = "cuda"
-        #     self.model = self.model.to("cuda")
+    def _compute_losses(self, outputs, batch):
+        segmentation_logits = outputs["segmentation_logits"].float()
+        severity_logits = outputs["severity_logits"].float()
+        segmentation_targets = batch["segmentation"].to(self.device, non_blocking=True)
+        segmentation_valid = batch["segmentation_valid"].to(self.device, non_blocking=True)
+        patient_scores = batch["patient_score"].to(self.device, non_blocking=True)
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(), 
-            lr=self.learning_rate,
-            betas = (0.9, 0.999),
-            eps=1e-8,
-            weight_decay=self.weight_decay)
+        if segmentation_valid.any():
+            valid_logits = segmentation_logits[segmentation_valid]
+            valid_targets = segmentation_targets[segmentation_valid]
+            cross_entropy = F.cross_entropy(valid_logits, valid_targets)
+            probabilities = torch.softmax(valid_logits, dim=1)
+            dice_scores = []
+            for class_index in range(1, self.model.out_channels):
+                class_targets = valid_targets == class_index
+                if class_targets.any():
+                    class_probabilities = probabilities[:, class_index]
+                    intersection = (class_probabilities * class_targets).sum()
+                    denominator = class_probabilities.sum() + class_targets.sum()
+                    dice_scores.append((2 * intersection + 1e-5) / (denominator + 1e-5))
+            dice = torch.stack(dice_scores).mean() if dice_scores else cross_entropy.new_tensor(1.0)
+            segmentation_loss = cross_entropy + (1 - dice)
+        else:
+            segmentation_loss = segmentation_logits.sum() * 0
+            dice = segmentation_loss.detach()
 
-        
-        self.criterion = DiceLoss()
-        
-        cls_pos_weight = getattr(self, "pos_weight", torch.tensor(1.0))
-        cls_pos_weight = cls_pos_weight.to(self.device)
-        self.classification_loss = nn.BCEWithLogitsLoss(pos_weight=cls_pos_weight)
-        
-        self._configure_scheduler()
-        #Since we have to define our own training loop, we have to keep track
-        #of these variables for best model, early stopping and learning rate decrease
-        best_val_loss = float("inf")
-        epochs_no_improve = 0
-        lr_plateau_counter = 0
+        severity_targets = patient_scores - 1
+        severity_loss = F.cross_entropy(severity_logits, severity_targets)
 
-        #Also we want to keep track of our training history
-        history = {
-            "train_loss": [], 
-            "train_acc": [], 
-            "train_sensitivity": [], 
-            "train_ppv": [], 
-            "train_npv": [],
-            "train_fpr": [],
-            "train_specificity": [],
-            "train_fnr": [],
-            "val_loss": [], 
-            "val_acc": [], 
-            "val_sensitivity": [], 
-            "val_ppv": [], 
-            "val_npv": [],
-            "train_dice": [], 
-            "val_dice": [],
-            "val_fpr": [],
-            "val_specificity": [],
-            "val_fnr": [],
+        severity_predictions = severity_logits.argmax(dim=1) + 1
+        severity_mae = (severity_predictions - patient_scores).abs().float().mean()
+        severity_accuracy = (severity_predictions == patient_scores).float().mean()
+        total_loss = self.seg_weight * segmentation_loss + self.cls_weight * severity_loss
+        return {
+            "total": total_loss,
+            "segmentation": segmentation_loss,
+            "severity": severity_loss,
+            "dice": dice,
+            "severity_mae": severity_mae,
+            "severity_accuracy": severity_accuracy,
         }
 
-        eps = 1e-6
-        for epoch in range(1, self.epochs + 1):
-            # Get current MTL weights for display
-            mtl_info = []
-            for task, param in self.multi_task_loss.log_vars.items():
-                weight = torch.exp(-param).item()
-                mtl_info.append(f"{task}={weight:.4f}")
-            mtl_str = ", ".join(mtl_info)
-            print(f"Epoch {epoch}: , Weights: [{mtl_str}]")
-            
-            self.model.train()
-            train_losses = []
-            train_dice_scores = []
-            train_mse_scores = [] 
-            all_preds, all_labels = [], []
-            train_seg_losses, train_cls_losses = [], []
-            train_total_losses = []
-            for x_batch, mask_batch, y_batch, coord_batch in tqdm(self.train_loader):
-                x_batch = x_batch.to(self.device, non_blocking=True)
-                mask_batch = mask_batch.to(self.device, non_blocking=True)
-                y_batch = y_batch.float().unsqueeze(1)
-                y_batch = y_batch.to(self.device, non_blocking=True)
+    def train(self) -> dict:
+        """Train full-volume segmentation and patient-level ordinal severity heads."""
+        if not hasattr(self, "train_loader") or not hasattr(self, "val_loader"):
+            raise ValueError("Create dataloaders before calling train().")
 
-                outputs = self.model(x_batch)
-                # outputs[0] is segmentation, outputs[1] is classification (if any)
-                # We only use segmentation output for the new loss
-                seg_logits = outputs[0]
-                seg_probs = torch.sigmoid(seg_logits)
-                
-                # Target for segmentation is the heatmap (mask_batch)
-                # Assuming single channel output for now or matching channels
-                targets = mask_batch[:, 0:1]
-                
-                seg_loss = self.criterion(seg_probs, targets)
-                
-                # Classification loss
-                cls_loss = torch.tensor(0.0, device=self.device)
-                if self.cls_weight > 0 and len(outputs) > 1:
-                    cls_logits = outputs[1]
-                    cls_loss = self.classification_loss(cls_logits, y_batch)
-                
-                # Combine losses using Multi-Task Uncertainty Weights
-                loss_dict = {"segmentation": seg_loss}
-                
-                if self.cls_weight > 0 and len(outputs) > 1:
-                    loss_dict["classification"] = cls_loss
-                    
-                loss = self.multi_task_loss(loss_dict)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        use_mixed_precision = self.mixed_precision and self.device.type == "cuda"
+        scaler = torch.amp.GradScaler("cuda", enabled=use_mixed_precision)
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
+        self._configure_scheduler()
 
+        metric_names = ("total", "segmentation", "severity", "dice", "severity_mae", "severity_accuracy")
+        history = {f"{split}_{name}": [] for split in ("train", "val") for name in metric_names}
+        best_val_loss = float("inf")
+        epochs_no_improve = 0
+
+        def run_epoch(loader, training):
+            self.model.train(training)
+            totals = {name: [] for name in metric_names}
+            if training:
                 self.optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                self.optimizer.step()
+            loader_length = len(loader)
+            split_name = "train" if training else "validation"
+            for batch_index, batch in enumerate(tqdm(loader, leave=False, desc=split_name)):
+                images = batch["image"].to(self.device, non_blocking=True)
+                with torch.set_grad_enabled(training):
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        dtype=torch.float16,
+                        enabled=use_mixed_precision,
+                    ):
+                        outputs = self.model(images)
+                        losses = self._compute_losses(outputs, batch)
 
-                # Track individual task losses
-                train_seg_losses.append(seg_loss.item())
-                if "classification" in loss_dict:
-                    train_cls_losses.append(cls_loss.item())
-                train_total_losses.append(loss_dict.item())
+                    if training:
+                        group_start = (
+                            batch_index // self.gradient_accumulation_steps
+                        ) * self.gradient_accumulation_steps
+                        group_size = min(
+                            self.gradient_accumulation_steps,
+                            loader_length - group_start,
+                        )
+                        scaler.scale(losses["total"] / group_size).backward()
+                        is_update_step = (
+                            (batch_index + 1) % self.gradient_accumulation_steps == 0
+                            or batch_index + 1 == loader_length
+                        )
+                        if is_update_step:
+                            scaler.step(self.optimizer)
+                            scaler.update()
+                            self.optimizer.zero_grad(set_to_none=True)
+                for name in metric_names:
+                    totals[name].append(float(losses[name].detach().cpu()))
+            return {
+                name: float(np.mean(values)) if values else 0.0
+                for name, values in totals.items()
+            }
 
-                #Dice calculation (soft dice on soft targets)
-                with torch.no_grad():
-                    mask_probs = torch.sigmoid(outputs[0].detach().to(torch.float32))
-                    targets = mask_batch[:, 0:1].detach().to(torch.float32)
-
-                    pred_sum = mask_probs.sum(dim=(1, 2, 3, 4))
-                    target_sum = targets.sum(dim=(1, 2, 3, 4))
-                    intersection = (mask_probs * targets).sum(dim=(1, 2, 3, 4))
-                    dice = (2.0 * intersection + eps) / (pred_sum + target_sum + eps)
-                    train_dice_scores.append(dice)
-
-                #Aggregate metrics
-                all_preds.append(outputs[1].detach())
-                all_labels.append(y_batch.detach())
-            
-            #DICE loss stats
-            train_dice_scores = torch.cat(train_dice_scores, dim=0).to(self.device, dtype=torch.float32)
-            train_dice_mean = train_dice_scores.cpu().numpy().mean() if train_dice_scores.numel() > 0 else 0.0
-
-            #Classification stats
-            all_preds = torch.cat(all_preds, dim=0).to(self.device, dtype=torch.float32).contiguous()
-            all_labels = torch.cat(all_labels, dim=0).to(self.device, dtype=torch.float32).contiguous()
-
-            probs = torch.sigmoid(all_preds)
-            train_preds_np = (probs >= 0.5).int().cpu().numpy().ravel()
-            train_labels_np  = all_labels.int().cpu().numpy().ravel()
-
-            tp = np.logical_and(train_preds_np == 1, train_labels_np == 1).sum()
-            tn = np.logical_and(train_preds_np == 0, train_labels_np == 0).sum()
-            fp = np.logical_and(train_preds_np == 1, train_labels_np == 0).sum()
-            fn = np.logical_and(train_preds_np == 0, train_labels_np == 1).sum()
-            train_acc = (tp + tn) / max(len(train_labels_np), 1)
-            train_sens = tp / max(tp + fn, 1)          # sensitivity/recall
-            train_ppv = tp / max(tp + fp, 1)           # precision/PPV
-            train_npv = tn / max(tn + fn, 1)           # NPV
-            train_fpr = fp / max(tn + fp, 1)           # false positive rate
-            train_specificity = tn / max(tn + fp, 1)   # true negative rate
-            train_fnr = fn / max(fn + tp, 1)           # false positive rate
-
-            history["train_loss"].append(np.mean(train_losses))
-            history["train_acc"].append(train_acc)
-            history["train_sensitivity"].append(train_sens)
-            history["train_ppv"].append(train_ppv)
-            history["train_npv"].append(train_npv)
-            history["train_fpr"].append(train_fpr)
-            history["train_specificity"].append(train_specificity)
-            history["train_fnr"].append(train_fnr)
-            history["train_dice"].append(train_dice_mean)
-            
-            # Track individual task losses (use safe mean to avoid numpy warnings)
-            train_seg_loss_mean = sum(train_seg_losses) / len(train_seg_losses) if train_seg_losses else 0.0
-            train_cls_loss_mean = sum(train_cls_losses) / len(train_cls_losses) if train_cls_losses else 0.0
-            train_total_loss_mean = sum(train_total_losses) / len(train_total_losses) if train_total_losses else 0.0
-            history.setdefault("train_seg_loss", []).append(train_seg_loss_mean)
-            history.setdefault("train_cls_loss", []).append(train_cls_loss_mean)
-            history.setdefault("train_total_loss", []).append(train_total_loss_mean)
-
-            # --- Validation ---
-            self.model.eval()
-            val_losses = []
-            val_dice_scores = []
-            val_preds_list, val_labels_list = [], []
+        for epoch in range(1, self.epochs + 1):
+            train_metrics = run_epoch(self.train_loader, training=True)
             with torch.no_grad():
-                val_losses = []
-                val_dice_scores = []
-                val_seg_losses, val_cls_losses = [], []
-                val_total_losses = []
-                for x_batch, mask_batch, y_batch, coord_batch in self.val_loader:
-                    x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
-                    mask_batch = mask_batch.to(self.device, dtype=torch.float16, non_blocking=True)
-                    y_batch = y_batch.float().unsqueeze(1)
-                    y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
-                    coord_batch = coord_batch.to(self.device, dtype=torch.float32, non_blocking=True)
-                    outputs = self.model(x_batch)
-                    seg_logits = outputs[0]
-                    seg_probs = torch.sigmoid(seg_logits)
-                    targets = mask_batch[:, 0:1]
-                    
-                    seg_loss = self.criterion(seg_probs, targets)
-                    
-                    cls_loss = torch.tensor(0.0, device=self.device)
-                    if self.cls_weight > 0 and len(outputs) > 1:
-                        cls_logits = outputs[1]
-                        cls_loss = self.classification_loss(cls_logits, y_batch)
-                
-                    loss_dict = {"segmentation": seg_loss}
-                    if self.cls_weight > 0 and len(outputs) > 1:
-                        loss_dict["classification"] = cls_loss
-                    
-                    loss = self.multi_task_loss(loss_dict)
-                        
-                    # Track individual task losses
-                    val_seg_losses.append(seg_loss.item())
-                    if "classification" in loss_dict:
-                        val_cls_losses.append(cls_loss.item())
-                    val_total_losses.append(loss.item())
+                val_metrics = run_epoch(self.val_loader, training=False)
 
-                    #DICE loss (soft dice on soft targets)
-                    mask_probs = torch.sigmoid(outputs[0].detach().to(torch.float32))
-                    targets = mask_batch[:, 0:1].detach().to(torch.float32)
+            for name in metric_names:
+                history[f"train_{name}"].append(train_metrics[name])
+                history[f"val_{name}"].append(val_metrics[name])
 
-                    pred_sum = mask_probs.sum(dim=(1, 2, 3, 4))
-                    target_sum = targets.sum(dim=(1, 2, 3, 4))
-                    intersection = (mask_probs * targets).sum(dim=(1, 2, 3, 4))
-                    dice = (2.0 * intersection + eps) / (pred_sum + target_sum + eps)
-                    val_dice_scores.append(dice)
-
-                    #Classification loss
-                    preds = outputs[1].detach().to(torch.float32)
-                    labels = y_batch.detach().to(torch.float32)
-
-                    # Sigmoid + threshold (done in float32 for numerical stability)
-                    probs = torch.sigmoid(preds)
-                    preds_np = (probs >= 0.5).int().cpu().numpy()
-                    labs_np  = labels.int().cpu().numpy()
-                    val_preds_list.append(preds_np)
-                    val_labels_list.append(labs_np)
-
-                    del preds, labels, probs, preds_np, labs_np, outputs, loss
-                    torch.cuda.empty_cache()
-
-            val_dice_scores = torch.cat(val_dice_scores, dim=0).to(self.device, dtype=torch.float32)
-            val_dice_scores = self._safe_gather(val_dice_scores)
-            val_dice_mean = val_dice_scores.cpu().numpy().mean() if val_dice_scores.numel() > 0 else 0.0
-            
-            val_preds_np = np.concatenate(val_preds_list, axis=0).ravel()
-            val_labels_np = np.concatenate(val_labels_list, axis=0).ravel()
-
-            tp = np.logical_and(val_preds_np == 1, val_labels_np == 1).sum()
-            tn = np.logical_and(val_preds_np == 0, val_labels_np == 0).sum()
-            fp = np.logical_and(val_preds_np == 1, val_labels_np == 0).sum()
-            fn = np.logical_and(val_preds_np == 0, val_labels_np == 1).sum()
-            val_acc = (tp + tn) / max(len(val_labels_np), 1)
-            val_sens = tp / max(tp + fn, 1)
-            val_ppv = tp / max(tp + fp, 1)
-            val_npv = tn / max(tn + fn, 1)
-            val_fpr = fp / max(tn + fp, 1)         
-            val_specificity = tn / max(tn + fp, 1)   
-            val_fnr = fn / max(fn + tp, 1)
-            val_loss = np.mean(val_losses)
-            
-            # Calculate mean task losses (use safe mean to avoid numpy warnings)
-            val_seg_loss_mean = sum(val_seg_losses) / len(val_seg_losses) if val_seg_losses else 0.0
-            val_cls_loss_mean = sum(val_cls_losses) / len(val_cls_losses) if val_cls_losses else 0.0
-            val_total_loss_mean = sum(val_total_losses) / len(val_total_losses) if val_total_losses else 0.0
-            # Use segmentation loss as primary validation metric
-            val_loss = val_seg_loss_mean
-            history["val_loss"].append(val_loss)
-            history["val_acc"].append(val_acc)
-            history["val_sensitivity"].append(val_sens)
-            history["val_ppv"].append(val_ppv)
-            history["val_npv"].append(val_npv)
-            history["val_fpr"].append(val_fpr)
-            history["val_specificity"].append(val_specificity)
-            history["val_fnr"].append(val_fnr)
-            history["val_dice"].append(val_dice_mean)
-            history.setdefault("val_seg_loss", []).append(val_seg_loss_mean)
-            history.setdefault("val_cls_loss", []).append(val_cls_loss_mean)
-            history.setdefault("val_total_loss", []).append(val_total_loss_mean)
-            
-            # Log Multi-Task Weights (sigma^2 = exp(s))
-            mtl_weights = {}
-            for task, param in self.multi_task_loss.log_vars.items():
-                sigma2 = torch.exp(param).item()
-                weight = 1.0 / sigma2
-                mtl_weights[f"mtl_weight/{task}"] = weight
-                history.setdefault(f"mtl_weight_{task}", []).append(weight)
-
-            train_seg_loss_mean = history["train_seg_loss"][-1]
-            train_cls_loss_mean = history["train_cls_loss"][-1]
-            train_total_loss_mean = history["train_total_loss"][-1]
-            
-            # Get current learning rate
-            current_lr = self.optimizer.param_groups[0]["lr"]
-            
-            # Create table header with dynamic variables
-            print(f"\n{'='*150}")
-            print(f"Epoch {epoch}/{self.epochs} | LR: {current_lr:.2e} | Weights: [{mtl_str}]")
-            print(f"{'='*150}")
-            
-            # Metrics table
-            print(f"{'':8} | {'TotalLoss':>9} | {'SegLoss':>8} | {'ClsLoss':>8} | {'Acc':>6} | {'Sens':>6} | {'FPR':>6} | {'Spec':>6} | {'FNR':>6} | {'PPV':>6} | {'NPV':>6} | {'Dice':>6} ")
-            print(f"{'-'*150}")
             print(
-                f"{'Train':8} | {train_total_loss_mean:9.4f} | {train_seg_loss_mean:8.4f} | {train_cls_loss_mean:8.4f} | "
-                f"{train_acc:6.4f} | {train_sens:6.4f} | {train_fpr:6.4f} | {train_specificity:6.4f} | {train_fnr:6.4f} | {train_ppv:6.4f} | {train_npv:6.4f} | "
-                f"{train_dice_mean:6.4f}"
+                f"Epoch {epoch}/{self.epochs} | "
+                f"train loss {train_metrics['total']:.4f} "
+                f"(seg {train_metrics['segmentation']:.4f}, "
+                f"severity {train_metrics['severity']:.4f}, Dice {train_metrics['dice']:.4f}, "
+                f"score acc {train_metrics['severity_accuracy']:.3f}) | "
+                f"val loss {val_metrics['total']:.4f} "
+                f"(seg {val_metrics['segmentation']:.4f}, "
+                f"severity {val_metrics['severity']:.4f}, Dice {val_metrics['dice']:.4f}, "
+                f"score MAE {val_metrics['severity_mae']:.3f}, "
+                f"score acc {val_metrics['severity_accuracy']:.3f})"
             )
-            print(
-                f"{'Val':8} | {val_total_loss_mean:9.4f} | {val_seg_loss_mean:8.4f} | {val_cls_loss_mean:8.4f} | "
-                f"{val_acc:6.4f} | {val_sens:6.4f} | {val_fpr:6.4f} | {val_specificity:6.4f} | {val_fnr:6.4f} | {val_ppv:6.4f} | {val_npv:6.4f} | "
-                f"{val_dice_mean:6.4f}"
-            )
-            print(f"{'='*150}\n")
-            
-            # per-epoch checkpoint (optional)
-            ckpt_path = Path(self.checkpoint_path)
-            epoch_ckpt = ckpt_path.with_name(f"{epoch}_{ckpt_path.name}")
-            epoch_ckpt.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(self.model.state_dict(), epoch_ckpt)
-            # --- Checkpointing ---
+
+            val_loss = val_metrics["total"]
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                Path(self.checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
                 torch.save(self.model.state_dict(), self.checkpoint_path)
-                print(f"Validation loss improved: saved to {self.checkpoint_path}")
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
-
-
-            # --- Early stopping ---
-            if epochs_no_improve >= self.early_stopping_patience:
-                print(f"Early stopping triggered at epoch {epoch}")
-                break
-
-            # --- ReduceLROnPlateau (manual) ---
-            if self.scheduler_name == "step" and len(history["val_loss"]) > self.lr_reduction_patience:
-                if lr_plateau_counter > self.lr_reduction_patience and history["val_loss"][-1] >= history["val_loss"][-(self.lr_reduction_patience + 1)]:
-                    old_lr = self.optimizer.param_groups[0]['lr']
-                    new_lr = max(old_lr * self.lr_reduction_factor, self.min_lr)
-                    if new_lr < old_lr:
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = new_lr
-                        print(f"ReduceLROnPlateau: lr reduced from {old_lr:.1e} to {new_lr:.1e}")
-                        lr_plateau_counter = 0
-                else:
-                    lr_plateau_counter += 1
 
             if self.scheduler:
                 if self.scheduler_step_mode == "epoch":
                     self.scheduler.step()
                 elif self.scheduler_step_mode == "plateau":
-                    self.scheduler.step(history["val_loss"][-1])
+                    self.scheduler.step(val_loss)
+
+            if epochs_no_improve >= self.early_stopping_patience:
+                print(f"Early stopping triggered at epoch {epoch}")
+                break
 
         return history
