@@ -16,43 +16,59 @@ input_folder = "Data/raw_images"
 output_folder = "Data/converted_nii_images"
 subfolder = "PETMR-WB-PSMA"
 
+def find_pet_folder(patient_folder):
+    pet_modalities = [
+        "PET-PSMA-PROSTATA",
+        "COREG-PET-PSMA-PROSTATA",
+        "COREG-E-1-PET-PSMA-PROSTATA-MRJ",
+        "E-1-PET-PSMA-PROSTATA",
+        "COREG-PET-PSMA-PROSTATA1"
+    ]
+    
+    for modality in pet_modalities:
+        pet_folder = os.path.join(patient_folder, subfolder, modality)
+        if os.path.exists(pet_folder):
+            return pet_folder
+    
+    return None
+
+pet_modalities = [
+    "PET-PSMA-PROSTATA",
+    "COREG-PET-PSMA-PROSTATA",
+    "COREG-E-1-PET-PSMA-PROSTATA-MRJ",
+    "E-1-PET-PSMA-PROSTATA",
+    "COREG-PET-PSMA-PROSTATA1"
+]
+
 modalities = [
     #ADC MRI
     "ADC-10-6-MM-S",
     "COREG-ADC-10-6-MM-S-1",
+    "COREG-ADC-10-6-MM-S",
     #T2 MRI
     "AX-T2-FRFSE",
     "AX-T2-FRFSE-SEN",
     "AX-T2-FRFSE-SUPPLERENDE",
     "COREG-AX-T2-FRFSE-MRJ",
+    "COREG-AX-T2-FRFSE",
     "COREG-AX-T2-FRFSE1",
-    #PET
-    "PET-PSMA-PROSTATA",
-    "COREG-E-1-PET-PSMA-PROSTATA-MRJ",
-    "E-1-PET-PSMA-PROSTATA",
-    "COREG-PET-PSMA-PROSTATA1",
     #SEGMENTATIONS
     "RT-STRUCT-PET-PSMA-PROSTATA",
     "SEGMENTATION-AX-T2-FRFSE-SEN",
     "RT-STRUCT-COREG-E-1-PET-PSMA-PROSTATA-MRJ",
-    "RT-STRUCT-COREG-PET-PSMA-PROSTATA1"
+    "RT-STRUCT-COREG-PET-PSMA-PROSTATA1",
+    "RT-STRUCT-COREG-PET-PSMA-PROSTATA"
 ]
 
 dicom_files = os.listdir(input_folder)
 
 for patient in tqdm(dicom_files, desc="Converting DICOM to NIfTI"):
     patient_folder = os.path.join(input_folder, patient)
-    pet_folder = os.path.join(patient_folder, subfolder, "PET-PSMA-PROSTATA")
-    if not os.path.exists(pet_folder):
-        pet_folder = os.path.join(patient_folder, subfolder, "COREG-E-1-PET-PSMA-PROSTATA-MRJ")
-        if not os.path.exists(pet_folder):
-            pet_folder = os.path.join(patient_folder, subfolder, "E-1-PET-PSMA-PROSTATA")
-            if not os.path.exists(pet_folder):
-                pet_folder = os.path.join(patient_folder, subfolder, "COREG-PET-PSMA-PROSTATA1")
-                if not os.path.exists(pet_folder):
-                    print(f"Warning: PET folder '{pet_folder}' does not exist for patient '{patient}'. Skipping.")
-                    print()
-                    continue    
+    pet_folder = find_pet_folder(patient_folder)
+    if not pet_folder:
+        print(f"Warning: PET folder '{pet_folder}' does not exist for patient '{patient}'. Skipping.")
+        print()
+        continue
     print(pet_folder)
     print()
     try:
@@ -76,7 +92,8 @@ for patient in tqdm(dicom_files, desc="Converting DICOM to NIfTI"):
 
         # Convert DICOM to NIfTI
         if modality == "RT-STRUCT-PET-PSMA-PROSTATA" or modality == "RT-STRUCT-COREG-E-1-PET-PSMA-PROSTATA-MRJ"\
-            or modality == "RT-STRUCT-COREG-PET-PSMA-PROSTATA1" or modality == "RT-STRUCT-COREG-PER-PSMA-PROSTATA1":
+            or modality == "RT-STRUCT-COREG-PET-PSMA-PROSTATA1" or modality == "RT-STRUCT-COREG-PET-PSMA-PROSTATA1"\
+            or modality == "RT-STRUCT-COREG-PET-PSMA-PROSTATA":
             print(patient, modality)
             #The segmentations are stored in a RTstruct file and they are directly
             #mapped on top ofthe PET-PSMA-PROSTATA scan.
@@ -91,6 +108,8 @@ for patient in tqdm(dicom_files, desc="Converting DICOM to NIfTI"):
                 modality_short = "MRI_T2"
             elif "ADC-10-6" in modality:
                 modality_short = "MRI_ADC"
-                
             command = f"dcm2niix -z y -f study_{study_id}_{modality_short} -o {patient_output_folder} {scan_folder}"
             subprocess.run(command, shell=True, check=True)
+    #Create PET 
+    command = f"dcm2niix -z y -f study_{study_id}_PET -o {patient_output_folder} {pet_folder}"
+    subprocess.run(command, shell=True, check=True)
