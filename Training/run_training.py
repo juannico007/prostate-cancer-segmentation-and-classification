@@ -7,8 +7,9 @@ import json
 from datetime import datetime
 import numpy as np
 from model import UNet
-from training_pipeline import TrainingPipeline, load_patch_records
+from training_pipeline import TrainingPipeline, load_records
 import pandas as pd
+
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
@@ -18,8 +19,11 @@ HYPERPARAMS = {
     "data_dir": "Data/resampled_images",
     "data_csv": "Data/data.csv",
     "input_shape": (128, 128, 128),
-    "batch_size": 5,
-    "epochs": 40,
+    "batch_size": 1,
+    "num_workers": 2,
+    "mixed_precision": True,
+    "gradient_accumulation_steps": 2,
+    "epochs": 200,
     "learning_rate": 1e-4,
     "weight_decay": 1e-3,
     "scheduler":{
@@ -38,41 +42,45 @@ HYPERPARAMS = {
     # "scheduler": {
     #     "name": "onecycle",
     # },
-    
+    "proportion_to_use": 0.8,
     "train_ratio": 0.7,
     "lr_reduction_epochs": 10,
+    "loss_weights" : {"classification": 1,
+                      "segmentation": 1},
     "unet": {
-        "in_channels": 1,
-        "out_channels": 1,
+        "in_channels": 2,
+        "out_channels": 4,
         "n_blocks": 4,
         "start_filters": 16,
         "activation": "relu",
         "normalization": "group4",
         "conv_mode": "same",
         "up_mode": "trilinear",
-        "middle_neurons": 256,
-        "class_output": 1,
         "dropout": 0.2,
         "attention": True,
+        "num_severity_levels": 5,
     },
+    "model_dir": "results/plain_unet",
+    "output_data_dir": "output",
+    "model_name": "first_model",
+    "model_version": "0.2"
 }
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 def main():
     hyperparams = HYPERPARAMS.copy()
-    model_name = os.environ.get("RUN_MODEL_NAME")
-    model_version = os.environ.get("RUN_MODEL_VERSION")
+    model_name = hyperparams["model_name"]
+    model_version = hyperparams["model_version"]
     input_shape = tuple(hyperparams["input_shape"])
 
-    # SageMaker model / output directories (or "." locally)
-    model_dir = Path(os.environ.get("SM_MODEL_DIR", "."))
-    output_dir = Path(os.environ.get("SM_OUTPUT_DATA_DIR", "."))
+    model_dir = Path(hyperparams["model_dir"])
+    output_dir = Path(hyperparams["output_data_dir"])
 
     
     artifact_id = f"{model_name}_{model_version}"
-    local_artifact_root = REPO_ROOT / f"{model_name}_{model_version}"
+    local_artifact_root = REPO_ROOT / f"{model_dir}_{output_dir}"
     model_dir = local_artifact_root
     output_dir = local_artifact_root
     print(f"Local artifacts will be stored in {local_artifact_root}")
@@ -92,10 +100,8 @@ def main():
     proportion = float(hyperparams.get("proportion_to_use", 1.0))
     split_seed = int(hyperparams.get("split_seed", 42))
 
-    print("\n[1/5] Loading patch metadata...")
-    records = load_patch_records(data_csv)
-    print("initial records:")
-    print(records)
+    print("\n[1/5] Loading records metadata...")
+    records = load_records(data_csv)
     if not records:
         raise ValueError(f"No records found in {data_csv}")
 
@@ -109,6 +115,7 @@ def main():
         keep_series = set(rng.choice(series_ids, size=keep_count, replace=False))
         records = [r for r in records if r.series_id in keep_series]
         print(f"[Info] Using {keep_count}/{len(series_ids)} series (~{proportion*100:.1f}%).")
+        print(f"[Info] Series IDs used: {sorted(keep_series)}")
     else:
         keep_series = set(series_ids)
 
@@ -121,14 +128,7 @@ def main():
     print("\n[2/5] Building model...")
 
     unet_kwargs = dict(hyperparams.get("unet", {}))
-    model = UNet(**unet_kwargs)
-
-    if torch.cuda.is_available():
-    #     # Run the summary on CPU to avoid exhausting limited GPU VRAM
-    #     print(summary(model.to("cpu"), input_size=(1,) + input_shape, device="cpu"))
-        model = model.to(device)
-    # else:
-    #     print(summary(model, input_size=(1,) + input_shape, device="cpu"))
+    model = UNet(**unet_kwargs).to(device)
 
     print("\n[3/5] Setting up training pipeline...")
     pipeline = TrainingPipeline(
@@ -144,12 +144,15 @@ def main():
         split_seed=hyperparams.get("split_seed", 42),
         scheduler_config=hyperparams["scheduler"],
         loss_weights=hyperparams.get("loss_weights"),
+        mixed_precision=hyperparams["mixed_precision"],
+        gradient_accumulation_steps=hyperparams["gradient_accumulation_steps"],
+        num_workers=hyperparams["num_workers"],
     )
 
     print("\n[4/5] Creating Pytorch dataloaders...")
     train_dataset, val_dataset = pipeline.create_dataloaders(
         nii_path=patients_path,
-        data_csv="data_csv",
+        data_csv=data_csv,
         train_ratio=hyperparams.get("train_ratio", 0.8),
         split_seed=hyperparams.get("split_seed", 42),
         records=records,
