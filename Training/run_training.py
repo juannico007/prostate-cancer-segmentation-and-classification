@@ -56,14 +56,15 @@ HYPERPARAMS = {
         "normalization": "group4",
         "conv_mode": "same",
         "up_mode": "trilinear",
+        "middle_neurons": 512,
         "dropout": 0.2,
         "attention": True,
         "num_severity_levels": 5,
     },
-    "model_dir": "results/plain_unet",
+    "model_dir": "results/plain_classifier_to_segmentation",
     "output_data_dir": "output",
-    "model_name": "first_model",
-    "model_version": "0.2"
+    "model_name": "segmentator_to_classifier",
+    "model_version": "0.1"
 }
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

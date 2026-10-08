@@ -385,8 +385,10 @@ class ClassifierBlock(nn.Module):
         nn.init.zeros_(self.fc2.bias)
 
     def forward(self, encoded_features):
-        y = self.gap(encoded_features)
-        y = y.view(y.size(0), -1)
+        if isinstance(encoded_features, torch.Tensor):
+            encoded_features = (encoded_features,)
+        pooled_features = [self.gap(feature).flatten(1) for feature in encoded_features]
+        y = torch.cat(pooled_features, dim=1)
 
         y = self.fc1(y)
         y = self.act1(y)
@@ -482,8 +484,12 @@ class UNet(nn.Module):
             self.up_blocks.append(up_block)
 
         bottleneck_channels = self.start_filters * (2 ** (self.n_blocks - 1))
+        #decoder_channels = sum(self.start_filters * (2 ** i) for i in range(self.n_blocks - 1))
+        #decoder_channels = 2 ** (self.n_blocks)
+        #print(decoder_channels)
         self.segmentation_head = get_conv_layer(num_filters_out, self.out_channels, kernel_size=1, padding=0)
-        self.severity_head = ClassifierBlock(in_channels=bottleneck_channels,
+        
+        self.severity_head = ClassifierBlock(in_channels=bottleneck_channels + self.out_channels,
                                              middle_neurons=self.middle_neurons,
                                              out_neurons=self.num_severity_levels,
                                              drop=self.dropout)
@@ -521,17 +527,29 @@ class UNet(nn.Module):
 
     def forward(self, x: torch.Tensor):
         encoder_output = []
+        severity_features = []
         for module in self.down_blocks:
             x, before_pooling = module(x)
             encoder_output.append(before_pooling)
 
-        severity_logits = self.severity_head(x)
+        severity_features.append(x)
 
         for i, module in enumerate(self.up_blocks):
             before_pool = encoder_output[-(i + 2)]
             x = module(before_pool, x)
+            # Append the last feature map to the severity features for classification
+            #Didn't go with all of them as conflicting gradients were making the training
+            #worse, but this can be changed to use all of them if needed
+            
+            #if i == len(self.up_blocks) - 1:
+            #    severity_features.append(x)
+
         
         segmentation_logits = self.segmentation_head(x)
+
+        #Append segmentation result to the features for classification to give more info
+        severity_features.append(segmentation_logits)
+        severity_logits = self.severity_head(severity_features)
 
         return {
             "segmentation_logits": segmentation_logits,
