@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import Counter, defaultdict
 import itk
 from torch.nn import utils
 from model import UNet
@@ -281,6 +281,7 @@ class TrainingPipeline:
         mixed_precision: bool = True,
         gradient_accumulation_steps: int = 1,
         num_workers: int = 2,
+            training_task: str = "joint",
         ):
         """
         Initialize training pipeline.
@@ -314,6 +315,11 @@ class TrainingPipeline:
         self.mixed_precision = mixed_precision
         self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
         self.num_workers = max(0, int(num_workers))
+        if training_task not in {"joint", "segmentation", "classification"}:
+            raise ValueError(
+                "training_task must be 'joint', 'segmentation', or 'classification'."
+            )
+        self.training_task = training_task
         self.scheduler_config = dict(scheduler_config) if scheduler_config else {
             "name": "step",
             "step_size": 100,
@@ -370,6 +376,28 @@ class TrainingPipeline:
             raise ValueError("No training studies have both PET and MRI_T2 volumes.")
         if not val_records:
             raise ValueError("No validation studies have both PET and MRI_T2 volumes.")
+
+        class_ids = sorted({
+            max(lesion.label for lesion in record.lesions)
+            for record in train_records + val_records
+        })
+        print("Patient class distribution (maximum PRIMARY lesion label):")
+        for split_name, split_records in (
+            ("train", train_records),
+            ("validation", val_records),
+        ):
+            class_counts = Counter(
+                max(lesion.label for lesion in record.lesions)
+                for record in split_records
+            )
+            total = len(split_records)
+            distribution = ", ".join(
+                f"class {class_id}: {class_counts[class_id]} "
+                f"({class_counts[class_id] / total:.1%})"
+                for class_id in class_ids
+            )
+            print(f"  {split_name} ({total} patients): {distribution}")
+
         #For now we won't add data augmentation, but it will come as a TODO
 
         print("training records:", [i.series_id for i in train_records])
@@ -503,7 +531,12 @@ class TrainingPipeline:
         severity_predictions = severity_logits.argmax(dim=1) + 1
         severity_mae = (severity_predictions - patient_scores).abs().float().mean()
         severity_accuracy = (severity_predictions == patient_scores).float().mean()
-        total_loss = self.seg_weight * segmentation_loss + self.cls_weight * severity_loss
+        if self.training_task == "segmentation":
+            total_loss = self.seg_weight * segmentation_loss
+        elif self.training_task == "classification":
+            total_loss = self.cls_weight * severity_loss
+        else:
+            total_loss = self.seg_weight * segmentation_loss + self.cls_weight * severity_loss
         return {
             "total": total_loss,
             "segmentation": segmentation_loss,
@@ -520,10 +553,22 @@ class TrainingPipeline:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
+        if self.training_task == "segmentation":
+            for parameter in self.model.severity_head.parameters():
+                parameter.requires_grad_(False)
+            for name, parameter in self.model.named_parameters():
+                if not name.startswith("severity_head."):
+                    parameter.requires_grad_(True)
+        elif self.training_task == "classification":
+            for name, parameter in self.model.named_parameters():
+                parameter.requires_grad_(name.startswith("severity_head."))
+        else:
+            for parameter in self.model.parameters():
+                parameter.requires_grad_(True)
         use_mixed_precision = self.mixed_precision and self.device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=use_mixed_precision)
         self.optimizer = optim.Adam(
-            self.model.parameters(),
+            (parameter for parameter in self.model.parameters() if parameter.requires_grad),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
@@ -535,7 +580,13 @@ class TrainingPipeline:
         epochs_no_improve = 0
 
         def run_epoch(loader, training):
-            self.model.train(training)
+            if self.training_task == "classification" and training:
+                self.model.eval()
+                self.model.severity_head.train()
+            else:
+                self.model.train(training)
+                if self.training_task == "segmentation":
+                    self.model.severity_head.eval()
             totals = {name: [] for name in metric_names}
             if training:
                 self.optimizer.zero_grad(set_to_none=True)

@@ -16,7 +16,7 @@ from training_pipeline import ProstateDataset, collate_fn, load_records
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ARTIFACT_DIR = REPO_ROOT / "results/plain_unet_output"
+DEFAULT_ARTIFACT_DIR = REPO_ROOT / "results/staged_segmentation_then_classification"
 SEGMENTATION_LABELS = ("background", "score_3", "score_4", "score_5")
 
 
@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=DEFAULT_ARTIFACT_DIR / "decoder_to_classifier_0.1.pt",
+        default=DEFAULT_ARTIFACT_DIR / "classifier_best.pt",
     )
     parser.add_argument(
         "--config",
@@ -180,7 +180,7 @@ def main():
     output_dir = (args.output_dir or checkpoint_path.parent / "evaluation").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     segmentations_dir = output_dir / "predicted_segmentations"
-    history_path = (args.history or checkpoint_path.parent / "history.pickle").resolve()
+    history_path = (args.history or checkpoint_path.parent / "classifier_history.pickle").resolve()
     if not history_path.is_file():
         raise FileNotFoundError(f"Training history not found: {history_path}")
     loss_plot_path = output_dir / "loss_curves.png"
