@@ -16,7 +16,7 @@ from training_pipeline import ProstateDataset, collate_fn, load_records
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ARTIFACT_DIR = REPO_ROOT / "results/staged_segmentation_then_classification"
+DEFAULT_ARTIFACT_DIR = REPO_ROOT / "results/coral_unet_output"
 SEGMENTATION_LABELS = ("background", "score_3", "score_4", "score_5")
 
 
@@ -27,12 +27,12 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=DEFAULT_ARTIFACT_DIR / "classifier_best.pt",
+        default=DEFAULT_ARTIFACT_DIR / "coral_loss_only_classifier_0.2.pt",
     )
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_ARTIFACT_DIR / "hyperparameters.json",
+        default=DEFAULT_ARTIFACT_DIR / "coral_loss_only_classifier_hyperparameters.json",
     )
     parser.add_argument("--history", type=Path)
     parser.add_argument("--data-dir", type=Path)
@@ -74,7 +74,9 @@ def select_records(records, config, split, seed_override):
     return [record for record in records if record.series_id in allowed_ids]
 
 
-def decode_severity(logits):
+def decode_severity(logits, classification_loss="cross_entropy"):
+    if classification_loss == "coral":
+        return int((logits.float() > 0).sum().item()) + 1
     return int(logits.float().argmax(dim=-1).item()) + 1
 
 
@@ -180,7 +182,7 @@ def main():
     output_dir = (args.output_dir or checkpoint_path.parent / "evaluation").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     segmentations_dir = output_dir / "predicted_segmentations"
-    history_path = (args.history or checkpoint_path.parent / "classifier_history.pickle").resolve()
+    history_path = (args.history or checkpoint_path.parent / "coral_loss_only_classifier_history.pickle").resolve()
     if not history_path.is_file():
         raise FileNotFoundError(f"Training history not found: {history_path}")
     loss_plot_path = output_dir / "loss_curves.png"
@@ -192,7 +194,10 @@ def main():
     dataset = ProstateDataset(data_dir, records)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = UNet(**config["unet"]).to(device)
+    classification_loss = config.get("classification_loss", "cross_entropy")
+    model_kwargs = dict(config["unet"])
+    model_kwargs["ordinal_classification"] = classification_loss == "coral"
+    model = UNet(**model_kwargs).to(device)
     state = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.eval()
@@ -225,7 +230,10 @@ def main():
         with torch.inference_mode():
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 output = model(image)
-        predicted_score = decode_severity(output["severity_logits"][0])
+        predicted_score = decode_severity(
+            output["severity_logits"][0],
+            classification_loss,
+        )
         true_score = int(batch["patient_score"][0])
         severity_confusion[true_score - 1, predicted_score - 1] += 1
         severity_errors.append(abs(true_score - predicted_score))

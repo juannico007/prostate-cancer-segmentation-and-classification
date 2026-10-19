@@ -278,6 +278,8 @@ class TrainingPipeline:
         split_seed: int = 42,
         scheduler_config: Optional[Dict[str, Any]] = None,
         loss_weights: Optional[Dict[str, float]] = None,
+        classification_loss: str = "cross_entropy",
+        gaussian_sigma: float = 1.0,
         mixed_precision: bool = True,
         gradient_accumulation_steps: int = 1,
         num_workers: int = 2,
@@ -322,6 +324,14 @@ class TrainingPipeline:
         lw = loss_weights or {}
         self.seg_weight = float(lw.get("segmentation", 1.0))
         self.cls_weight = float(lw.get("classification", 1.0))
+        if classification_loss not in {"cross_entropy", "coral", "gaussian"}:
+            raise ValueError(
+                "classification_loss must be 'cross_entropy', 'coral', or 'gaussian'."
+            )
+        if gaussian_sigma <= 0:
+            raise ValueError("gaussian_sigma must be greater than zero.")
+        self.classification_loss = classification_loss
+        self.gaussian_sigma = float(gaussian_sigma)
 
         self.scheduler_step_mode: Optional[str] = None
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
@@ -498,9 +508,43 @@ class TrainingPipeline:
             dice = segmentation_loss.detach()
 
         severity_targets = patient_scores - 1
-        severity_loss = F.cross_entropy(severity_logits, severity_targets)
+        if self.classification_loss == "coral":
+            threshold_count = self.model.num_severity_levels - 1
+            thresholds = torch.arange(threshold_count, device=self.device)
+            ordinal_targets = (severity_targets.unsqueeze(1) > thresholds).float()
+            if severity_logits.shape[1] != threshold_count:
+                raise ValueError(
+                    f"CORAL expects {threshold_count} threshold logits, "
+                    f"received {severity_logits.shape[1]}."
+                )
+            severity_loss = F.binary_cross_entropy_with_logits(
+                severity_logits,
+                ordinal_targets,
+            )
+            severity_predictions = (severity_logits > 0).sum(dim=1) + 1
+        elif self.classification_loss == "gaussian":
+            class_indices = torch.arange(
+                self.model.num_severity_levels,
+                device=self.device,
+                dtype=severity_logits.dtype,
+            )
+            gaussian_targets = torch.exp(
+                -0.5
+                * ((class_indices.unsqueeze(0) - severity_targets.unsqueeze(1))
+                   / self.gaussian_sigma) ** 2
+            )
+            gaussian_targets = gaussian_targets / gaussian_targets.sum(
+                dim=1,
+                keepdim=True,
+            )
+            severity_loss = -(
+                gaussian_targets * F.log_softmax(severity_logits, dim=1)
+            ).sum(dim=1).mean()
+            severity_predictions = severity_logits.argmax(dim=1) + 1
+        else:
+            severity_loss = F.cross_entropy(severity_logits, severity_targets)
+            severity_predictions = severity_logits.argmax(dim=1) + 1
 
-        severity_predictions = severity_logits.argmax(dim=1) + 1
         severity_mae = (severity_predictions - patient_scores).abs().float().mean()
         severity_accuracy = (severity_predictions == patient_scores).float().mean()
         total_loss = self.seg_weight * segmentation_loss + self.cls_weight * severity_loss

@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 import pickle
 import torch
@@ -46,7 +47,9 @@ HYPERPARAMS = {
     "train_ratio": 0.7,
     "lr_reduction_epochs": 10,
     "loss_weights" : {"classification": 1,
-                      "segmentation": 1},
+                      "segmentation": 0},
+    "classification_loss": "cross_entropy",
+    "gaussian_sigma": 1.0,
     "unet": {
         "in_channels": 2,
         "out_channels": 4,
@@ -62,7 +65,7 @@ HYPERPARAMS = {
     },
     "model_dir": "results/plain_unet",
     "output_data_dir": "output",
-    "model_name": "first_model",
+    "model_name": "coral_loss_only_classifier",
     "model_version": "0.2"
 }
 
@@ -70,7 +73,29 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 def main():
+    parser = argparse.ArgumentParser(description="Train the prostate cancer segmentation and classification model.")
+    parser.add_argument(
+        "--classification-loss",
+        choices=("cross_entropy", "coral", "gaussian"),
+        help="Classification objective; defaults to the value in HYPERPARAMS.",
+    )
+    parser.add_argument(
+        "--gaussian-sigma",
+        type=float,
+        help="Standard deviation for Gaussian soft targets.",
+    )
+    args = parser.parse_args()
     hyperparams = HYPERPARAMS.copy()
+    classification_loss = args.classification_loss or hyperparams.get(
+        "classification_loss", "cross_entropy"
+    )
+    gaussian_sigma = (
+        args.gaussian_sigma
+        if args.gaussian_sigma is not None
+        else float(hyperparams.get("gaussian_sigma", 1.0))
+    )
+    hyperparams["classification_loss"] = classification_loss
+    hyperparams["gaussian_sigma"] = gaussian_sigma
     model_name = hyperparams["model_name"]
     model_version = hyperparams["model_version"]
     input_shape = tuple(hyperparams["input_shape"])
@@ -91,7 +116,7 @@ def main():
 
     checkpoint_name = f"{artifact_id}.pt" if artifact_id else "prostate_cancer_classification.pt"
     checkpoint_path = model_dir / checkpoint_name
-    history_path = output_dir / "history.pickle"
+    history_path = output_dir / f"{model_name}_history.pickle"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -128,6 +153,8 @@ def main():
     print("\n[2/5] Building model...")
 
     unet_kwargs = dict(hyperparams.get("unet", {}))
+    unet_kwargs["ordinal_classification"] = classification_loss == "coral"
+    hyperparams["unet"] = unet_kwargs
     model = UNet(**unet_kwargs).to(device)
 
     print("\n[3/5] Setting up training pipeline...")
@@ -144,6 +171,8 @@ def main():
         split_seed=hyperparams.get("split_seed", 42),
         scheduler_config=hyperparams["scheduler"],
         loss_weights=hyperparams.get("loss_weights"),
+        classification_loss=classification_loss,
+        gaussian_sigma=gaussian_sigma,
         mixed_precision=hyperparams["mixed_precision"],
         gradient_accumulation_steps=hyperparams["gradient_accumulation_steps"],
         num_workers=hyperparams["num_workers"],
@@ -171,7 +200,7 @@ def main():
     print(f"History saved to {history_path}")
 
     # save hyperparameters
-    hyperparams_path = output_dir / "hyperparameters.json"
+    hyperparams_path = output_dir / f"{model_name}_hyperparameters.json"
     with open(hyperparams_path, "w", encoding="utf-8") as handle:
         json.dump(hyperparams, handle, indent=2, sort_keys=True)
     print(f"Hyperparameters saved to {hyperparams_path}")
