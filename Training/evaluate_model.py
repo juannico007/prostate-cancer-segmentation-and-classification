@@ -16,8 +16,9 @@ from training_pipeline import ProstateDataset, collate_fn, load_records
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ARTIFACT_DIR = REPO_ROOT / "results/staged_segmentation_then_classification"
+DEFAULT_ARTIFACT_DIR = REPO_ROOT / "results/testing_segmentation_influence_output"
 SEGMENTATION_LABELS = ("background", "score_3", "score_4", "score_5")
+model_weight = 1.0
 
 
 def parse_args():
@@ -27,12 +28,12 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=DEFAULT_ARTIFACT_DIR / "classifier_best.pt",
+        default=DEFAULT_ARTIFACT_DIR / f"segmentation_weight_{model_weight}_0.1.pt",
     )
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_ARTIFACT_DIR / "hyperparameters.json",
+        default=DEFAULT_ARTIFACT_DIR / f"segmentation_weight_{model_weight}_hyperparameters.json",
     )
     parser.add_argument("--history", type=Path)
     parser.add_argument("--data-dir", type=Path)
@@ -177,10 +178,10 @@ def main():
         config = json.load(stream)
     data_dir = (args.data_dir or Path(config["data_dir"])).resolve()
     data_csv = (args.data_csv or Path(config["data_csv"])).resolve()
-    output_dir = (args.output_dir or checkpoint_path.parent / "evaluation").resolve()
+    output_dir = (args.output_dir or checkpoint_path.parent / f"evaluation_{model_weight}").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     segmentations_dir = output_dir / "predicted_segmentations"
-    history_path = (args.history or checkpoint_path.parent / "classifier_history.pickle").resolve()
+    history_path = (args.history or checkpoint_path.parent / f"segmentation_weight_{model_weight}_history.pickle").resolve()
     if not history_path.is_file():
         raise FileNotFoundError(f"Training history not found: {history_path}")
     loss_plot_path = output_dir / "loss_curves.png"

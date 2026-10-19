@@ -60,39 +60,19 @@ HYPERPARAMS = {
         "attention": True,
         "num_severity_levels": 5,
     },
-    "model_dir": "results/plain_unet",
+    "model_dir": "results/testing_segmentation_influence",
     "output_data_dir": "output",
-    "model_name": "first_model",
-    "model_version": "0.2"
+    "model_name": "segmentation_weight_0",
+    "model_version": "0.1"
 }
+
+SEGMENTATION_WEIGHTS = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 def main():
     hyperparams = HYPERPARAMS.copy()
-    model_name = hyperparams["model_name"]
-    model_version = hyperparams["model_version"]
-    input_shape = tuple(hyperparams["input_shape"])
-
-    model_dir = Path(hyperparams["model_dir"])
-    output_dir = Path(hyperparams["output_data_dir"])
-
-    
-    artifact_id = f"{model_name}_{model_version}"
-    local_artifact_root = REPO_ROOT / f"{model_dir}_{output_dir}"
-    model_dir = local_artifact_root
-    output_dir = local_artifact_root
-    print(f"Local artifacts will be stored in {local_artifact_root}")
-
-    # artifact directories
-    model_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    checkpoint_name = f"{artifact_id}.pt" if artifact_id else "prostate_cancer_classification.pt"
-    checkpoint_path = model_dir / checkpoint_name
-    history_path = output_dir / "history.pickle"
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     patients_path = Path(hyperparams["data_dir"])
@@ -124,76 +104,103 @@ def main():
     # neg_count = sum(1 for r in records if r.label == 0)
     # print(f"[Info] Patch counts -> positives: {pos_count}, negatives: {neg_count}, total: {len(records)}")
     # print(f"[Info] Series covered: {len({r.series_id for r in records})}")
+    
+    for seg_weight in SEGMENTATION_WEIGHTS:
+        hyperparams["loss_weights"]["segmentation"] = seg_weight
+        hyperparams["model_name"] = f"segmentation_weight_{seg_weight}"
+        
+        model_name = hyperparams["model_name"]
+        model_version = hyperparams["model_version"]
+        input_shape = tuple(hyperparams["input_shape"])
 
-    print("\n[2/5] Building model...")
+        model_dir = Path(hyperparams["model_dir"])
+        output_dir = Path(hyperparams["output_data_dir"])
 
-    unet_kwargs = dict(hyperparams.get("unet", {}))
-    model = UNet(**unet_kwargs).to(device)
+        
+        artifact_id = f"{model_name}_{model_version}"
+        local_artifact_root = REPO_ROOT / f"{model_dir}_{output_dir}"
+        model_dir = local_artifact_root
+        output_dir = local_artifact_root
+        print(f"Local artifacts will be stored in {local_artifact_root}")
 
-    print("\n[3/5] Setting up training pipeline...")
-    pipeline = TrainingPipeline(
-        model=model,
-        batch_size=hyperparams["batch_size"],
-        epochs=hyperparams["epochs"],
-        learning_rate=hyperparams["learning_rate"],
-        weight_decay=hyperparams["weight_decay"],
-        lr_reduction_patience=hyperparams["lr_reduction_epochs"],
-        checkpoint_path=str(checkpoint_path),
-        data_csv=hyperparams["data_csv"],
-        train_ratio=hyperparams.get("train_ratio", 0.8),
-        split_seed=hyperparams.get("split_seed", 42),
-        scheduler_config=hyperparams["scheduler"],
-        loss_weights=hyperparams.get("loss_weights"),
-        mixed_precision=hyperparams["mixed_precision"],
-        gradient_accumulation_steps=hyperparams["gradient_accumulation_steps"],
-        num_workers=hyperparams["num_workers"],
-    )
+        # artifact directories
+        model_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n[4/5] Creating Pytorch dataloaders...")
-    train_dataset, val_dataset = pipeline.create_dataloaders(
-        nii_path=patients_path,
-        data_csv=data_csv,
-        train_ratio=hyperparams.get("train_ratio", 0.8),
-        split_seed=hyperparams.get("split_seed", 42),
-        records=records,
-    )
+        checkpoint_name = f"{artifact_id}.pt" if artifact_id else "prostate_cancer_classification.pt"
+        checkpoint_path = model_dir / checkpoint_name
+        history_path = output_dir / f"segmentation_weight_{seg_weight}_history.pickle"
 
-    print("\n[5/5] Training model...")
-    history = pipeline.train()
 
-    print("Training completed!")
-    print(f"Best model saved to: {pipeline.checkpoint_path}")
+        print("\n[2/5] Building model...")
 
-    # save history
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(history_path, "wb") as handle:
-        pickle.dump(history, handle, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"History saved to {history_path}")
+        unet_kwargs = dict(hyperparams.get("unet", {}))
+        model = UNet(**unet_kwargs).to(device)
 
-    # save hyperparameters
-    hyperparams_path = output_dir / "hyperparameters.json"
-    with open(hyperparams_path, "w", encoding="utf-8") as handle:
-        json.dump(hyperparams, handle, indent=2, sort_keys=True)
-    print(f"Hyperparameters saved to {hyperparams_path}")
+        print("\n[3/5] Setting up training pipeline...")
+        pipeline = TrainingPipeline(
+            model=model,
+            batch_size=hyperparams["batch_size"],
+            epochs=hyperparams["epochs"],
+            learning_rate=hyperparams["learning_rate"],
+            weight_decay=hyperparams["weight_decay"],
+            lr_reduction_patience=hyperparams["lr_reduction_epochs"],
+            checkpoint_path=str(checkpoint_path),
+            data_csv=hyperparams["data_csv"],
+            train_ratio=hyperparams.get("train_ratio", 0.8),
+            split_seed=hyperparams.get("split_seed", 42),
+            scheduler_config=hyperparams["scheduler"],
+            loss_weights=hyperparams.get("loss_weights"),
+            mixed_precision=hyperparams["mixed_precision"],
+            gradient_accumulation_steps=hyperparams["gradient_accumulation_steps"],
+            num_workers=hyperparams["num_workers"],
+        )
 
-    # save metadata
-    if artifact_id:
-        metadata = {
-            "artifact_id": artifact_id,
-            "model_name": model_name,
-            "model_version": model_version,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "files": {
-                "checkpoint": checkpoint_path.name,
-                "history": history_path.name,
-                "hyperparameters": hyperparams_path.name,
-            },
-            "cli_args": hyperparams,
-        }
-        metadata_path = output_dir / "metadata.json"
-        with open(metadata_path, "w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, indent=2, sort_keys=True)
-        print(f"Metadata saved to {metadata_path}")
+        print("\n[4/5] Creating Pytorch dataloaders...")
+        train_dataset, val_dataset = pipeline.create_dataloaders(
+            nii_path=patients_path,
+            data_csv=data_csv,
+            train_ratio=hyperparams.get("train_ratio", 0.8),
+            split_seed=hyperparams.get("split_seed", 42),
+            records=records,
+        )
+
+        print("\n[5/5] Training model...")
+        history = pipeline.train()
+
+        print("Training completed!")
+        print(f"Best model saved to: {pipeline.checkpoint_path}")
+
+        # save history
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(history_path, "wb") as handle:
+            pickle.dump(history, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"History saved to {history_path}")
+
+        # save hyperparameters
+        hyperparams_path = output_dir / f"segmentation_weight_{seg_weight}_hyperparameters.json"
+        with open(hyperparams_path, "w", encoding="utf-8") as handle:
+            json.dump(hyperparams, handle, indent=2, sort_keys=True)
+        print(f"Hyperparameters saved to {hyperparams_path}")
+
+        # save metadata
+        if artifact_id:
+            metadata = {
+                "artifact_id": artifact_id,
+                "model_name": model_name,
+                "model_version": model_version,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "files": {
+                    "checkpoint": checkpoint_path.name,
+                    "history": history_path.name,
+                    "hyperparameters": hyperparams_path.name,
+                },
+                "cli_args": hyperparams,
+            }
+            metadata_path = output_dir / f"segmentation_weight_{seg_weight}_metadata.json"
+            with open(metadata_path, "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2, sort_keys=True)
+            print(f"Metadata saved to {metadata_path}")
 
 
 if __name__ == "__main__":
