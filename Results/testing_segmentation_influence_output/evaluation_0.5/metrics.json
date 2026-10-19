@@ -1,0 +1,117 @@
+{
+  "checkpoint": "/home/nicolas/Documents/prostate-cancer-segmentation-and-classification/results/testing_segmentation_influence_output/segmentation_weight_0.5_0.1.pt",
+  "split": "val",
+  "evaluated_patients": 20,
+  "segmentation_patients": 20,
+  "skipped_patients": 2,
+  "patient_severity": {
+    "accuracy": 0.55,
+    "mean_absolute_error": 0.55,
+    "within_one_grade": 0.9,
+    "confusion_matrix_labels": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "confusion_matrix": [
+      [
+        0,
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        3,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        9,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        4,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        2
+      ]
+    ]
+  },
+  "segmentation": {
+    "class_labels": [
+      "background",
+      "score_3",
+      "score_4",
+      "score_5"
+    ],
+    "confusion_matrix": [
+      [
+        41896459,
+        16979,
+        352,
+        7972
+      ],
+      [
+        3989,
+        8680,
+        0,
+        1211
+      ],
+      [
+        244,
+        179,
+        0,
+        720
+      ],
+      [
+        1749,
+        235,
+        20,
+        4251
+      ]
+    ],
+    "classes": {
+      "background": {
+        "support": 41921762,
+        "precision": 0.9998572398204677,
+        "recall": 0.9993964232705677,
+        "dice": 0.9996267784377264
+      },
+      "score_3": {
+        "support": 13880,
+        "precision": 0.33291144095424385,
+        "recall": 0.6253602305475504,
+        "dice": 0.434510549896128
+      },
+      "score_4": {
+        "support": 1143,
+        "precision": 0.0,
+        "recall": 0.0,
+        "dice": 0.0
+      },
+      "score_5": {
+        "support": 6255,
+        "precision": 0.3003391267486223,
+        "recall": 0.6796163069544364,
+        "dice": 0.41658092018227255
+      },
+      "mean_foreground_dice": 0.28369715669280016
+    }
+  }
+}

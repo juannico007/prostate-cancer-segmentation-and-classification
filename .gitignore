@@ -6,3 +6,4 @@ converted_nii_images/
 resampled_images/
 Reloads/
 results/
+Results/*/*/predicted_segmentations/

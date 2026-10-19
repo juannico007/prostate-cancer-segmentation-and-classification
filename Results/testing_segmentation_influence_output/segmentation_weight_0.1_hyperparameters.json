@@ -1,0 +1,44 @@
+{
+  "batch_size": 1,
+  "data_csv": "Data/data.csv",
+  "data_dir": "Data/resampled_images",
+  "epochs": 200,
+  "gradient_accumulation_steps": 2,
+  "input_shape": [
+    128,
+    128,
+    128
+  ],
+  "learning_rate": 0.0001,
+  "loss_weights": {
+    "classification": 1,
+    "segmentation": 0.1
+  },
+  "lr_reduction_epochs": 10,
+  "mixed_precision": true,
+  "model_dir": "results/testing_segmentation_influence",
+  "model_name": "segmentation_weight_0.1",
+  "model_version": "0.1",
+  "num_workers": 2,
+  "output_data_dir": "output",
+  "proportion_to_use": 0.8,
+  "scheduler": {
+    "eta_min": 1e-06,
+    "name": "cosine"
+  },
+  "train_ratio": 0.7,
+  "unet": {
+    "activation": "relu",
+    "attention": true,
+    "conv_mode": "same",
+    "dropout": 0.2,
+    "in_channels": 2,
+    "n_blocks": 4,
+    "normalization": "group4",
+    "num_severity_levels": 5,
+    "out_channels": 4,
+    "start_filters": 16,
+    "up_mode": "trilinear"
+  },
+  "weight_decay": 0.001
+}

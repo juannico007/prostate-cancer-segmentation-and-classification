@@ -1,0 +1,117 @@
+{
+  "checkpoint": "/home/nicolas/Documents/prostate-cancer-segmentation-and-classification/results/testing_segmentation_influence_output/segmentation_weight_0.1_0.1.pt",
+  "split": "val",
+  "evaluated_patients": 20,
+  "segmentation_patients": 20,
+  "skipped_patients": 2,
+  "patient_severity": {
+    "accuracy": 0.55,
+    "mean_absolute_error": 0.5,
+    "within_one_grade": 0.95,
+    "confusion_matrix_labels": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "confusion_matrix": [
+      [
+        0,
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        4,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        9,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        4,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        2
+      ]
+    ]
+  },
+  "segmentation": {
+    "class_labels": [
+      "background",
+      "score_3",
+      "score_4",
+      "score_5"
+    ],
+    "confusion_matrix": [
+      [
+        41902802,
+        6958,
+        2236,
+        9766
+      ],
+      [
+        9113,
+        3156,
+        303,
+        1308
+      ],
+      [
+        494,
+        111,
+        23,
+        515
+      ],
+      [
+        1140,
+        441,
+        46,
+        4628
+      ]
+    ],
+    "classes": {
+      "background": {
+        "support": 41921762,
+        "precision": 0.9997435912668717,
+        "recall": 0.9995477289337218,
+        "dice": 0.9996456505063839
+      },
+      "score_3": {
+        "support": 13880,
+        "precision": 0.295893493343334,
+        "recall": 0.22737752161383284,
+        "dice": 0.2571498411146419
+      },
+      "score_4": {
+        "support": 1143,
+        "precision": 0.008819018404907975,
+        "recall": 0.020122484689413824,
+        "dice": 0.012263396427619302
+      },
+      "score_5": {
+        "support": 6255,
+        "precision": 0.28537953998890053,
+        "recall": 0.7398880895283773,
+        "dice": 0.41189035243859023
+      },
+      "mean_foreground_dice": 0.22710119666028383
+    }
+  }
+}
