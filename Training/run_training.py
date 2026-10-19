@@ -8,66 +8,11 @@ import json
 from datetime import datetime
 import numpy as np
 from model import UNet
-from training_pipeline import TrainingPipeline, load_records
+from training_pipeline import TrainingPipeline, load_records, split_records, write_split_csvs
 import pandas as pd
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-
-MODE_ENV_VAR = "TRAINING_MODE"
-
-HYPERPARAMS = {
-    "data_dir": "Data/resampled_images",
-    "data_csv": "Data/data.csv",
-    "input_shape": (128, 128, 128),
-    "batch_size": 1,
-    "num_workers": 2,
-    "mixed_precision": True,
-    "gradient_accumulation_steps": 2,
-    "epochs": 200,
-    "learning_rate": 1e-4,
-    "weight_decay": 1e-3,
-    "scheduler":{
-        "name" : "cosine",
-        "eta_min": 1e-6
-    },
-
-    # "scheduler": {
-    #     "name": "plateau",
-    #     "mode": "min",
-    #     "factor": 0.5,
-    #     "patience": 4,
-    #     "min_lr": 1e-6,
-    # },
-
-    # "scheduler": {
-    #     "name": "onecycle",
-    # },
-    "proportion_to_use": 0.8,
-    "train_ratio": 0.7,
-    "lr_reduction_epochs": 10,
-    "loss_weights" : {"classification": 1,
-                      "segmentation": 0},
-    "classification_loss": "cross_entropy",
-    "gaussian_sigma": 1.0,
-    "unet": {
-        "in_channels": 2,
-        "out_channels": 4,
-        "n_blocks": 4,
-        "start_filters": 16,
-        "activation": "relu",
-        "normalization": "group4",
-        "conv_mode": "same",
-        "up_mode": "trilinear",
-        "dropout": 0.2,
-        "attention": True,
-        "num_severity_levels": 5,
-    },
-    "model_dir": "results/plain_unet",
-    "output_data_dir": "output",
-    "model_name": "coral_loss_only_classifier",
-    "model_version": "0.2"
-}
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
@@ -75,9 +20,15 @@ ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 def main():
     parser = argparse.ArgumentParser(description="Train the prostate cancer segmentation and classification model.")
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=REPO_ROOT / "Training/run_config.json",
+        help="JSON config shared with Training/evaluate_model.py.",
+    )
+    parser.add_argument(
         "--classification-loss",
         choices=("cross_entropy", "coral", "gaussian"),
-        help="Classification objective; defaults to the value in HYPERPARAMS.",
+        help="Classification objective; defaults to the value in the config file.",
     )
     parser.add_argument(
         "--gaussian-sigma",
@@ -85,7 +36,14 @@ def main():
         help="Standard deviation for Gaussian soft targets.",
     )
     args = parser.parse_args()
-    hyperparams = HYPERPARAMS.copy()
+    config_path = args.config.resolve()
+    with config_path.open(encoding="utf-8") as stream:
+        hyperparams = json.load(stream)
+
+    def resolve_path(path):
+        path = Path(path)
+        return (path if path.is_absolute() else REPO_ROOT / path).resolve()
+
     classification_loss = args.classification_loss or hyperparams.get(
         "classification_loss", "cross_entropy"
     )
@@ -98,31 +56,26 @@ def main():
     hyperparams["gaussian_sigma"] = gaussian_sigma
     model_name = hyperparams["model_name"]
     model_version = hyperparams["model_version"]
-    input_shape = tuple(hyperparams["input_shape"])
 
-    model_dir = Path(hyperparams["model_dir"])
-    output_dir = Path(hyperparams["output_data_dir"])
-
-    
     artifact_id = f"{model_name}_{model_version}"
-    local_artifact_root = REPO_ROOT / f"{model_dir}_{output_dir}"
-    model_dir = local_artifact_root
-    output_dir = local_artifact_root
-    print(f"Local artifacts will be stored in {local_artifact_root}")
+    experiment_dir = resolve_path(hyperparams["experiment_dir"])
+    split_dir = experiment_dir / "splits"
+    for directory in (experiment_dir, split_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = experiment_dir / f"{artifact_id}.pt"
+    history_path = experiment_dir / f"{artifact_id}_history.pickle"
+    print(f"Experiment artifacts will be stored in {experiment_dir}")
 
-    # artifact directories
-    model_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    checkpoint_name = f"{artifact_id}.pt" if artifact_id else "prostate_cancer_classification.pt"
-    checkpoint_path = model_dir / checkpoint_name
-    history_path = output_dir / f"{model_name}_history.pickle"
+    print(f"Split manifests will be stored in {split_dir}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     patients_path = Path(hyperparams["data_dir"])
     data_csv = Path(hyperparams["data_csv"])
-    proportion = float(hyperparams.get("proportion_to_use", 1.0))
+    if not data_csv.is_absolute():
+        data_csv = REPO_ROOT / data_csv
+    patients_path = resolve_path(patients_path)
+    data_csv = resolve_path(data_csv)
     split_seed = int(hyperparams.get("split_seed", 42))
 
     print("\n[1/5] Loading records metadata...")
@@ -130,19 +83,15 @@ def main():
     if not records:
         raise ValueError(f"No records found in {data_csv}")
 
-    # patient-level subsampling by proportion_to_use
-    series_ids = sorted({r.series_id for r in records})
-    if not (0 < proportion <= 1):
-        raise ValueError("proportion_to_use must be in (0,1].")
-    if proportion < 1.0:
-        rng = np.random.default_rng(split_seed)
-        keep_count = max(1, int(round(len(series_ids) * proportion)))
-        keep_series = set(rng.choice(series_ids, size=keep_count, replace=False))
-        records = [r for r in records if r.series_id in keep_series]
-        print(f"[Info] Using {keep_count}/{len(series_ids)} series (~{proportion*100:.1f}%).")
-        print(f"[Info] Series IDs used: {sorted(keep_series)}")
-    else:
-        keep_series = set(series_ids)
+    splits = split_records(
+        records,
+        float(hyperparams.get("train_ratio", 0.7)),
+        float(hyperparams.get("validation_ratio", 0.15)),
+        float(hyperparams.get("test_ratio", 0.15)),
+        split_seed,
+    )
+    split_csv_paths = write_split_csvs(data_csv, splits, split_dir)
+    print("Split patient counts:", {name: len(split) for name, split in splits.items()})
 
     # report counts
     # pos_count = sum(1 for r in records if r.label == 1)
@@ -168,6 +117,8 @@ def main():
         checkpoint_path=str(checkpoint_path),
         data_csv=hyperparams["data_csv"],
         train_ratio=hyperparams.get("train_ratio", 0.8),
+        validation_ratio=hyperparams.get("validation_ratio", 0.1),
+        test_ratio=hyperparams.get("test_ratio", 0.1),
         split_seed=hyperparams.get("split_seed", 42),
         scheduler_config=hyperparams["scheduler"],
         loss_weights=hyperparams.get("loss_weights"),
@@ -183,8 +134,11 @@ def main():
         nii_path=patients_path,
         data_csv=data_csv,
         train_ratio=hyperparams.get("train_ratio", 0.8),
+        validation_ratio=hyperparams.get("validation_ratio", 0.1),
+        test_ratio=hyperparams.get("test_ratio", 0.1),
         split_seed=hyperparams.get("split_seed", 42),
         records=records,
+        splits=splits,
     )
 
     print("\n[5/5] Training model...")
@@ -200,7 +154,7 @@ def main():
     print(f"History saved to {history_path}")
 
     # save hyperparameters
-    hyperparams_path = output_dir / f"{model_name}_hyperparameters.json"
+    hyperparams_path = experiment_dir / f"{model_name}_hyperparameters.json"
     with open(hyperparams_path, "w", encoding="utf-8") as handle:
         json.dump(hyperparams, handle, indent=2, sort_keys=True)
     print(f"Hyperparameters saved to {hyperparams_path}")
@@ -213,13 +167,17 @@ def main():
             "model_version": model_version,
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "files": {
-                "checkpoint": checkpoint_path.name,
-                "history": history_path.name,
+                "checkpoint": str(checkpoint_path.relative_to(experiment_dir)),
+                "history": str(history_path.relative_to(experiment_dir)),
                 "hyperparameters": hyperparams_path.name,
+                "split_manifests": {
+                    name: str(path.relative_to(experiment_dir))
+                    for name, path in split_csv_paths.items()
+                },
             },
             "cli_args": hyperparams,
         }
-        metadata_path = output_dir / "metadata.json"
+        metadata_path = experiment_dir / "metadata.json"
         with open(metadata_path, "w", encoding="utf-8") as handle:
             json.dump(metadata, handle, indent=2, sort_keys=True)
         print(f"Metadata saved to {metadata_path}")

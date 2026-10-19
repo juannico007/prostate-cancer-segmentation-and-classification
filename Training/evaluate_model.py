@@ -16,7 +16,7 @@ from training_pipeline import ProstateDataset, collate_fn, load_records
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ARTIFACT_DIR = REPO_ROOT / "results/coral_unet_output"
+DEFAULT_RUN_CONFIG = REPO_ROOT / "Training/run_config.json"
 SEGMENTATION_LABELS = ("background", "score_3", "score_4", "score_5")
 
 
@@ -27,51 +27,19 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=DEFAULT_ARTIFACT_DIR / "coral_loss_only_classifier_0.2.pt",
     )
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_ARTIFACT_DIR / "coral_loss_only_classifier_hyperparameters.json",
+        default=DEFAULT_RUN_CONFIG,
     )
     parser.add_argument("--history", type=Path)
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--data-csv", type=Path)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--split", choices=("val", "train", "all"), default="val")
-    parser.add_argument("--num-examples", type=int, default=4)
-    parser.add_argument("--seed", type=int)
+    parser.add_argument("--split", choices=("val", "train", "test", "all"))
+    parser.add_argument("--num-examples", type=int)
     return parser.parse_args()
-
-
-def select_records(records, config, split, seed_override):
-    seed = int(config.get("split_seed", 42) if seed_override is None else seed_override)
-    series_ids = sorted({record.series_id for record in records})
-    proportion = float(config.get("proportion_to_use", 1.0))
-    if not 0 < proportion <= 1:
-        raise ValueError("proportion_to_use must be in (0, 1].")
-    if proportion < 1:
-        rng = np.random.default_rng(seed)
-        keep_count = max(1, int(round(len(series_ids) * proportion)))
-        selected_ids = set(rng.choice(series_ids, size=keep_count, replace=False))
-    else:
-        selected_ids = set(series_ids)
-
-    selected_series = sorted(selected_ids)
-    train_ratio = float(config.get("train_ratio", 0.8))
-    if not 0 < train_ratio < 1:
-        raise ValueError("train_ratio must be in (0, 1) to create train/validation splits.")
-    rng = np.random.default_rng(seed)
-    train_count = max(1, int(round(len(selected_series) * train_ratio)))
-    train_ids = set(rng.choice(selected_series, size=train_count, replace=False))
-
-    if split == "train":
-        allowed_ids = train_ids
-    elif split == "val":
-        allowed_ids = selected_ids - train_ids
-    else:
-        allowed_ids = selected_ids
-    return [record for record in records if record.series_id in allowed_ids]
 
 
 def decode_severity(logits, classification_loss="cross_entropy"):
@@ -169,28 +137,60 @@ def segmentation_metrics(confusion):
 def main():
     args = parse_args()
     config_path = args.config.resolve()
-    checkpoint_path = args.checkpoint.resolve()
     if not config_path.is_file():
-        raise FileNotFoundError(f"Hyperparameter config not found: {config_path}")
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        raise FileNotFoundError(f"Run config not found: {config_path}")
 
     with config_path.open(encoding="utf-8") as stream:
         config = json.load(stream)
-    data_dir = (args.data_dir or Path(config["data_dir"])).resolve()
-    data_csv = (args.data_csv or Path(config["data_csv"])).resolve()
-    output_dir = (args.output_dir or checkpoint_path.parent / "evaluation").resolve()
+
+    def resolve_path(path):
+        path = Path(path)
+        return (path if path.is_absolute() else REPO_ROOT / path).resolve()
+
+    experiment_dir = resolve_path(config["experiment_dir"])
+    artifact_id = f"{config['model_name']}_{config['model_version']}"
+    checkpoint_path = resolve_path(args.checkpoint) if args.checkpoint else (
+        experiment_dir / f"{artifact_id}.pt"
+    )
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    data_dir = resolve_path(args.data_dir or config["data_dir"])
+    data_csv = resolve_path(args.data_csv or config["data_csv"])
+    output_dir = resolve_path(args.output_dir) if args.output_dir else experiment_dir / "evaluation" / config["split"]
     output_dir.mkdir(parents=True, exist_ok=True)
     segmentations_dir = output_dir / "predicted_segmentations"
-    history_path = (args.history or checkpoint_path.parent / "coral_loss_only_classifier_history.pickle").resolve()
+    history_path = resolve_path(args.history) if args.history else (
+        experiment_dir / f"{artifact_id}_history.pickle"
+    )
     if not history_path.is_file():
         raise FileNotFoundError(f"Training history not found: {history_path}")
     loss_plot_path = output_dir / "loss_curves.png"
     plot_loss_curves(history_path, loss_plot_path)
 
-    records = select_records(load_records(data_csv), config, args.split, args.seed)
+    selected_split = args.split or config.get("split", "test")
+    split_dir = experiment_dir / "splits"
+    split_paths = {
+        "train": split_dir / "train_split.csv",
+        "validation": split_dir / "validation_split.csv",
+        "test": split_dir / "test_split.csv",
+    }
+    missing_splits = [path for path in split_paths.values() if not path.is_file()]
+    if missing_splits:
+        raise FileNotFoundError(
+            "Training split manifests not found; run training with this config first: "
+            + ", ".join(str(path) for path in missing_splits)
+        )
+    splits = {name: load_records(path) for name, path in split_paths.items()}
+    if selected_split == "all":
+        records = [record for split_records_list in splits.values() for record in split_records_list]
+    else:
+        split_name = "validation" if selected_split == "val" else selected_split
+        if split_name not in splits:
+            raise ValueError(f"Unknown configured split: {selected_split}")
+        records = splits[split_name]
     if not records:
-        raise ValueError(f"No records selected for split '{args.split}'.")
+        raise ValueError(f"No records selected for split '{selected_split}'.")
+    num_examples = args.num_examples if args.num_examples is not None else int(config.get("num_examples", 4))
     dataset = ProstateDataset(data_dir, records)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -260,7 +260,7 @@ def main():
         else:
             print(f"[info] patient {record.series_id}: severity evaluated; incomplete score 3-5 masks excluded from segmentation metrics")
 
-        if example_count < args.num_examples:
+        if example_count < num_examples:
             patient_path = data_dir / str(record.series_id)
             mri_paths = list(patient_path.rglob("*MRI_T2.nii.gz"))
             if len(mri_paths) == 1:
@@ -280,7 +280,9 @@ def main():
     severity_errors = np.asarray(severity_errors)
     metrics = {
         "checkpoint": str(checkpoint_path),
-        "split": args.split,
+        "split": selected_split,
+        "split_seed": int(config.get("split_seed", 42)),
+        "split_patient_counts": {name: len(records) for name, records in splits.items()},
         "evaluated_patients": evaluated_patients,
         "segmentation_patients": segmentation_patients,
         "skipped_patients": skipped_patients,
@@ -328,6 +330,7 @@ def main():
     print(f"Mean foreground segmentation Dice: {metrics['segmentation']['classes']['mean_foreground_dice']}")
     print(f"Saved metrics: {metrics_path}")
     print(f"Saved patient predictions: {predictions_path}")
+    print(f"Loaded split metadata CSVs from: {split_dir}")
     print(f"Saved loss curves: {loss_plot_path}")
     print(f"Saved per-channel segmentations: {segmentations_dir}")
     print(f"Saved confusion matrices: {output_dir}")
