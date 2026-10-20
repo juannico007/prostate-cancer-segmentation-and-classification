@@ -1,5 +1,5 @@
 {
-  "experiment_dir": "results/coral_loss_with_segmentation_1",
+  "experiment_dir": "results/gaussian_loss_segmentation_weight_1.0",
   "data_dir": "Data/resampled_images",
   "data_csv": "Data/data.csv",
   "input_shape": [
@@ -25,11 +25,11 @@
   "lr_reduction_epochs": 10,
   "loss_weights": {
     "classification": 1,
-    "segmentation": 0.5
+    "segmentation": 1
   },
-  "classification_loss": "coral",
+  "classification_loss": "gaussian",
   "gaussian_sigma": 1.0,
-  "model_name": "coral_loss_with_segmentation_1",
+  "model_name": "gaussian_loss_segmentation_weight_1.0",
   "model_version": "0.1",
   "split": "train",
   "num_examples": 4,
