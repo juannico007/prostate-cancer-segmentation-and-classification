@@ -1,0 +1,50 @@
+{
+  "experiment_dir": "results/gaussian_loss_segmentation_weight_1.0",
+  "data_dir": "Data/resampled_images",
+  "data_csv": "Data/data.csv",
+  "input_shape": [
+    128,
+    128,
+    128
+  ],
+  "batch_size": 1,
+  "num_workers": 2,
+  "mixed_precision": true,
+  "gradient_accumulation_steps": 2,
+  "epochs": 200,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.001,
+  "scheduler": {
+    "name": "cosine",
+    "eta_min": 0.000001
+  },
+  "train_ratio": 0.7,
+  "validation_ratio": 0.15,
+  "test_ratio": 0.15,
+  "split_seed": 42,
+  "lr_reduction_epochs": 10,
+  "loss_weights": {
+    "classification": 1,
+    "segmentation": 1
+  },
+  "classification_loss": "gaussian",
+  "gaussian_sigma": 1.0,
+  "model_name": "gaussian_loss_segmentation_weight_1.0",
+  "model_version": "0.1",
+  "split": "train",
+  "num_examples": 4,
+  "unet": {
+    "activation": "relu",
+    "attention": true,
+    "conv_mode": "same",
+    "dropout": 0.2,
+    "in_channels": 2,
+    "n_blocks": 4,
+    "normalization": "group4",
+    "num_severity_levels": 5,
+    "ordinal_classification": false,
+    "out_channels": 4,
+    "start_filters": 16,
+    "up_mode": "trilinear"
+  }
+}

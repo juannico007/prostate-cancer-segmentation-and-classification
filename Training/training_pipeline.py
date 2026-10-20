@@ -93,6 +93,76 @@ def load_records(data_csv: Path) -> List[Record]:
         ]
     return records
 
+
+def split_records(
+    records: List[Record],
+    train_ratio: float,
+    validation_ratio: float,
+    test_ratio: float,
+    split_seed: int,
+) -> Dict[str, List[Record]]:
+    ratios = (train_ratio, validation_ratio, test_ratio)
+    if any(ratio <= 0 or ratio >= 1 for ratio in ratios) or not np.isclose(sum(ratios), 1.0):
+        raise ValueError("train_ratio, validation_ratio, and test_ratio must be positive and sum to 1.")
+
+    series_ids = sorted({record.series_id for record in records})
+    if len(series_ids) < 3:
+        raise ValueError("At least three studies are required for train/validation/test splits.")
+
+    rng = np.random.default_rng(split_seed)
+    train_count = max(1, int(round(len(series_ids) * train_ratio)))
+    train_ids = set(rng.choice(series_ids, size=train_count, replace=False))
+    remaining_ids = sorted(set(series_ids) - train_ids)
+    validation_count = max(1, int(round(len(series_ids) * validation_ratio)))
+    if validation_count >= len(remaining_ids):
+        raise ValueError("Not enough studies remain to create non-empty validation and test splits.")
+    validation_ids = set(rng.choice(remaining_ids, size=validation_count, replace=False))
+    test_ids = set(remaining_ids) - validation_ids
+
+    return {
+        "train": [record for record in records if record.series_id in train_ids],
+        "validation": [record for record in records if record.series_id in validation_ids],
+        "test": [record for record in records if record.series_id in test_ids],
+    }
+
+
+def write_split_csvs(data_csv: Path, splits: Dict[str, List[Record]], output_dir: Path):
+    split_ids = {
+        split_name: {record.series_id for record in split_records}
+        for split_name, split_records in splits.items()
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_paths = {
+        "train": output_dir / "train_split.csv",
+        "validation": output_dir / "validation_split.csv",
+        "test": output_dir / "test_split.csv",
+    }
+    with data_csv.open(newline="", encoding="utf-8") as source:
+        reader = csv.DictReader(source)
+        if not reader.fieldnames or "study_id" not in reader.fieldnames:
+            raise ValueError(f"Data CSV must contain a study_id column: {data_csv}")
+        streams = {name: path.open("w", newline="", encoding="utf-8") for name, path in output_paths.items()}
+        try:
+            writers = {
+                name: csv.DictWriter(stream, fieldnames=reader.fieldnames)
+                for name, stream in streams.items()
+            }
+            for writer in writers.values():
+                writer.writeheader()
+            for row in reader:
+                try:
+                    series_id = int(row["study_id"])
+                except (TypeError, ValueError):
+                    continue
+                for split_name, ids in split_ids.items():
+                    if series_id in ids:
+                        writers[split_name].writerow(row)
+                        break
+        finally:
+            for stream in streams.values():
+                stream.close()
+    return output_paths
+
 class ProstateDataset(Dataset):
     """Dataset that fetches patient volumes using the records."""
 
@@ -275,9 +345,13 @@ class TrainingPipeline:
         checkpoint_path: str = "prostate_classification_best.pt",
         data_csv: Optional[Path] = None,
         train_ratio: float = 0.8,
+        validation_ratio: float = 0.1,
+        test_ratio: float = 0.1,
         split_seed: int = 42,
         scheduler_config: Optional[Dict[str, Any]] = None,
         loss_weights: Optional[Dict[str, float]] = None,
+        classification_loss: str = "cross_entropy",
+        gaussian_sigma: float = 1.0,
         mixed_precision: bool = True,
         gradient_accumulation_steps: int = 1,
         num_workers: int = 2,
@@ -310,6 +384,8 @@ class TrainingPipeline:
         self.data_csv = Path(data_csv) if data_csv else None
         self.checkpoint_path = checkpoint_path
         self.train_ratio = train_ratio
+        self.validation_ratio = validation_ratio
+        self.test_ratio = test_ratio
         self.split_seed = split_seed
         self.mixed_precision = mixed_precision
         self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
@@ -322,6 +398,14 @@ class TrainingPipeline:
         lw = loss_weights or {}
         self.seg_weight = float(lw.get("segmentation", 1.0))
         self.cls_weight = float(lw.get("classification", 1.0))
+        if classification_loss not in {"cross_entropy", "coral", "gaussian"}:
+            raise ValueError(
+                "classification_loss must be 'cross_entropy', 'coral', or 'gaussian'."
+            )
+        if gaussian_sigma <= 0:
+            raise ValueError("gaussian_sigma must be greater than zero.")
+        self.classification_loss = classification_loss
+        self.gaussian_sigma = float(gaussian_sigma)
 
         self.scheduler_step_mode: Optional[str] = None
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
@@ -332,8 +416,11 @@ class TrainingPipeline:
         nii_path: Path,
         data_csv: Path,
         train_ratio: Optional[float] = None,
+        validation_ratio: Optional[float] = None,
+        test_ratio: Optional[float] = None,
         split_seed: Optional[int] = None,
         records: Optional[List[Record]] = None,
+        splits: Optional[Dict[str, List[Record]]] = None,
     ) -> Tuple[DataLoader, DataLoader]:
         """
         Create PyTorch DataLoaders from patch metadata.
@@ -342,6 +429,8 @@ class TrainingPipeline:
             raise ValueError("data_csv or records must be provided for training.")
         data_csv = data_csv or self.data_csv
         train_ratio = train_ratio if train_ratio is not None else self.train_ratio
+        validation_ratio = validation_ratio if validation_ratio is not None else self.validation_ratio
+        test_ratio = test_ratio if test_ratio is not None else self.test_ratio
         split_seed = split_seed if split_seed is not None else self.split_seed
 
         if records is None:
@@ -351,12 +440,16 @@ class TrainingPipeline:
 
         volume_check = ProstateDataset(nii_path=nii_path, records=records)
 
-        rng = np.random.default_rng(split_seed)
-        series_ids = sorted({r.series_id for r in records})
-        keep_count = max(1, int(round(len(series_ids) * train_ratio)))
-        train_series = set(rng.choice(series_ids, size=keep_count, replace=False))
-        train_records = [r for r in records if r.series_id in train_series]
-        val_records = [r for r in records if r.series_id not in train_series]
+        if splits is None:
+            splits = split_records(
+                records,
+                train_ratio,
+                validation_ratio,
+                test_ratio,
+                split_seed,
+            )
+        train_records = splits["train"]
+        val_records = splits["validation"]
         missing_train = [r.series_id for r in train_records if not volume_check.has_required_volumes(r)]
         missing_val = [r.series_id for r in val_records if not volume_check.has_required_volumes(r)]
         train_records = [r for r in train_records if r.series_id not in set(missing_train)]
@@ -498,9 +591,43 @@ class TrainingPipeline:
             dice = segmentation_loss.detach()
 
         severity_targets = patient_scores - 1
-        severity_loss = F.cross_entropy(severity_logits, severity_targets)
+        if self.classification_loss == "coral":
+            threshold_count = self.model.num_severity_levels - 1
+            thresholds = torch.arange(threshold_count, device=self.device)
+            ordinal_targets = (severity_targets.unsqueeze(1) > thresholds).float()
+            if severity_logits.shape[1] != threshold_count:
+                raise ValueError(
+                    f"CORAL expects {threshold_count} threshold logits, "
+                    f"received {severity_logits.shape[1]}."
+                )
+            severity_loss = F.binary_cross_entropy_with_logits(
+                severity_logits,
+                ordinal_targets,
+            )
+            severity_predictions = (severity_logits > 0).sum(dim=1) + 1
+        elif self.classification_loss == "gaussian":
+            class_indices = torch.arange(
+                self.model.num_severity_levels,
+                device=self.device,
+                dtype=severity_logits.dtype,
+            )
+            gaussian_targets = torch.exp(
+                -0.5
+                * ((class_indices.unsqueeze(0) - severity_targets.unsqueeze(1))
+                   / self.gaussian_sigma) ** 2
+            )
+            gaussian_targets = gaussian_targets / gaussian_targets.sum(
+                dim=1,
+                keepdim=True,
+            )
+            severity_loss = -(
+                gaussian_targets * F.log_softmax(severity_logits, dim=1)
+            ).sum(dim=1).mean()
+            severity_predictions = severity_logits.argmax(dim=1) + 1
+        else:
+            severity_loss = F.cross_entropy(severity_logits, severity_targets)
+            severity_predictions = severity_logits.argmax(dim=1) + 1
 
-        severity_predictions = severity_logits.argmax(dim=1) + 1
         severity_mae = (severity_predictions - patient_scores).abs().float().mean()
         severity_accuracy = (severity_predictions == patient_scores).float().mean()
         total_loss = self.seg_weight * segmentation_loss + self.cls_weight * severity_loss

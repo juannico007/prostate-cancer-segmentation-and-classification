@@ -362,7 +362,8 @@ class ClassifierBlock(nn.Module):
         out_neurons: int,
         middle_neurons: int,
         drop: float,
-        activation: str = 'relu'
+        activation: str = 'relu',
+        ordinal: bool = False,
     ):
         super().__init__()
 
@@ -371,18 +372,28 @@ class ClassifierBlock(nn.Module):
         self.out_neurons = out_neurons
         self.drop = drop
         self.activation = activation
+        self.ordinal = ordinal
     
         self.gap = nn.AdaptiveAvgPool3d(1)
         self.fc1 = nn.Linear(self.in_channels, self.middle_neurons)
         self.act1 = get_activation(self.activation)
         self.dropout = nn.Dropout(self.drop)
-        self.fc2 = nn.Linear(self.middle_neurons, self.out_neurons)
+        self.fc2 = nn.Linear(
+            self.middle_neurons,
+            1 if self.ordinal else self.out_neurons,
+            bias=not self.ordinal,
+        )
+        if self.ordinal:
+            self.ordinal_bias = nn.Parameter(torch.zeros(self.out_neurons))
         
     def initialize_classifier(self):
         nn.init.kaiming_uniform_(self.fc1.weight, a=0, mode='fan_in', nonlinearity='relu')
         nn.init.zeros_(self.fc1.bias)
         nn.init.kaiming_uniform_(self.fc2.weight, a=0, mode='fan_in', nonlinearity='relu')
-        nn.init.zeros_(self.fc2.bias)
+        if self.fc2.bias is not None:
+            nn.init.zeros_(self.fc2.bias)
+        if self.ordinal:
+            nn.init.zeros_(self.ordinal_bias)
 
     def forward(self, encoded_features):
         y = self.gap(encoded_features)
@@ -392,6 +403,8 @@ class ClassifierBlock(nn.Module):
         y = self.act1(y)
         y = self.dropout(y)
         y = self.fc2(y)
+        if self.ordinal:
+            y = y + self.ordinal_bias
         return y
 
 class UNet(nn.Module):
@@ -427,6 +440,7 @@ class UNet(nn.Module):
         dropout: float = 0,
         attention: bool = False,
         num_severity_levels: int = 5,
+        ordinal_classification: bool = False,
     ):
         super().__init__()
 
@@ -442,6 +456,9 @@ class UNet(nn.Module):
         self.dropout = dropout
         self.attention = attention
         self.num_severity_levels = num_severity_levels
+        self.ordinal_classification = ordinal_classification
+        if self.num_severity_levels < 2:
+            raise ValueError("num_severity_levels must be at least 2.")
 
         self.down_blocks = []
         self.up_blocks = []
@@ -485,8 +502,13 @@ class UNet(nn.Module):
         self.segmentation_head = get_conv_layer(num_filters_out, self.out_channels, kernel_size=1, padding=0)
         self.severity_head = ClassifierBlock(in_channels=bottleneck_channels,
                                              middle_neurons=self.middle_neurons,
-                                             out_neurons=self.num_severity_levels,
-                                             drop=self.dropout)
+                                             out_neurons=(
+                                                 self.num_severity_levels - 1
+                                                 if self.ordinal_classification
+                                                 else self.num_severity_levels
+                                             ),
+                                             drop=self.dropout,
+                                             ordinal=self.ordinal_classification)
         self.severity_head.initialize_classifier()
         
         self.down_blocks = nn.ModuleList(self.down_blocks)
