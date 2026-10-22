@@ -35,6 +35,11 @@ def main():
         type=float,
         help="Standard deviation for Gaussian soft targets.",
     )
+    parser.add_argument(
+        "--class-weight-power",
+        type=float,
+        help="Exponent for inverse-frequency class weights; set class_weight_power to null in config to disable.",
+    )
     args = parser.parse_args()
     config_path = args.config.resolve()
     with config_path.open(encoding="utf-8") as stream:
@@ -52,8 +57,16 @@ def main():
         if args.gaussian_sigma is not None
         else float(hyperparams.get("gaussian_sigma", 1.0))
     )
+    class_weight_power = (
+        args.class_weight_power
+        if args.class_weight_power is not None
+        else hyperparams.get("class_weight_power", 2.0)
+    )
+    if class_weight_power is not None and class_weight_power <= 0:
+        raise ValueError("class_weight_power must be greater than zero or null.")
     hyperparams["classification_loss"] = classification_loss
     hyperparams["gaussian_sigma"] = gaussian_sigma
+    hyperparams["class_weight_power"] = class_weight_power
     model_name = hyperparams["model_name"]
     model_version = hyperparams["model_version"]
 
@@ -124,6 +137,7 @@ def main():
         loss_weights=hyperparams.get("loss_weights"),
         classification_loss=classification_loss,
         gaussian_sigma=gaussian_sigma,
+        class_weight_power=class_weight_power,
         mixed_precision=hyperparams["mixed_precision"],
         gradient_accumulation_steps=hyperparams["gradient_accumulation_steps"],
         num_workers=hyperparams["num_workers"],

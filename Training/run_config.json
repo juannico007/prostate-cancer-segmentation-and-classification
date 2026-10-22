@@ -1,5 +1,5 @@
 {
-  "experiment_dir": "results/gaussian_loss_segmentation_weight_1.0",
+  "experiment_dir": "results/weighting_no_augmentation/gaussian_with_segmentation",
   "data_dir": "Data/resampled_images",
   "data_csv": "Data/data.csv",
   "input_shape": [
@@ -29,9 +29,10 @@
   },
   "classification_loss": "gaussian",
   "gaussian_sigma": 1.0,
-  "model_name": "gaussian_loss_segmentation_weight_1.0",
-  "model_version": "0.1",
-  "split": "train",
+  "class_weight_power": 0.5,
+  "model_name": "gaussian_with_segmentation",
+  "model_version": "0.2",
+  "split": "val",
   "num_examples": 4,
   "unet": {
     "activation": "relu",
