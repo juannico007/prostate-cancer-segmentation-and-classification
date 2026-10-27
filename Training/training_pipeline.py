@@ -5,8 +5,6 @@ from model import UNet
 #from .data_augmentation import DataAugmentation, rotate_batch_gpu
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
-import torch.nn as nn
-import torch.nn.functional as F
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -15,20 +13,7 @@ from pathlib import Path
 import csv
 from dataclasses import dataclass
 import os
-
-
-def inverse_square_class_weights(class_counts, power=2.0):
-    if power <= 0:
-        raise ValueError("class_weight_power must be greater than zero.")
-    counts = torch.as_tensor(class_counts, dtype=torch.float64)
-    present = counts > 0
-    if not present.any():
-        raise ValueError("Cannot compute class weights when all class counts are zero.")
-    frequencies = counts[present] / counts[present].sum()
-    weights = torch.zeros_like(counts)
-    weights[present] = frequencies.pow(-power)
-    weights[present] /= weights[present].mean()
-    return weights.float()
+from loss_functions import TrainingLosses
 
 
 @dataclass
@@ -411,24 +396,14 @@ class TrainingPipeline:
             "step_size": 100,
             "gamma": 0.96,
         }
-        lw = loss_weights or {}
-        self.seg_weight = float(lw.get("segmentation", 1.0))
-        self.cls_weight = float(lw.get("classification", 1.0))
-        if classification_loss not in {"cross_entropy", "coral", "gaussian"}:
-            raise ValueError(
-                "classification_loss must be 'cross_entropy', 'coral', or 'gaussian'."
-            )
-        if gaussian_sigma <= 0:
-            raise ValueError("gaussian_sigma must be greater than zero.")
-        self.classification_loss = classification_loss
-        self.gaussian_sigma = float(gaussian_sigma)
-        if class_weight_power is not None and class_weight_power <= 0:
-            raise ValueError("class_weight_power must be greater than zero or None.")
-        self.class_weight_power = (
-            float(class_weight_power) if class_weight_power is not None else None
+        self.losses = TrainingLosses(
+            segmentation_classes=model.out_channels,
+            severity_levels=model.num_severity_levels,
+            loss_weights=loss_weights,
+            classification_loss=classification_loss,
+            gaussian_sigma=gaussian_sigma,
+            class_weight_power=class_weight_power,
         )
-        self.segmentation_class_weights = None
-        self.severity_class_weights = None
 
         self.scheduler_step_mode: Optional[str] = None
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
@@ -495,7 +470,7 @@ class TrainingPipeline:
             nii_path=nii_path,
             records=train_records,
         )
-        if self.class_weight_power is not None:
+        if self.losses.class_weight_power is not None:
             self._configure_class_weights(train_dataset)
         val_dataset = ProstateDataset(
             nii_path=nii_path,
@@ -551,23 +526,16 @@ class TrainingPipeline:
             segmentation_counts += counts
             valid_segmentation_patients += 1
 
-        self.severity_class_weights = inverse_square_class_weights(
-            severity_counts,
-            self.class_weight_power,
-        )
-        self.segmentation_class_weights = inverse_square_class_weights(
-            segmentation_counts,
-            self.class_weight_power,
-        )
+        self.losses.configure_class_weights(segmentation_counts, severity_counts)
         print(
             "[Info] Inverse-frequency severity weights:",
-            self.severity_class_weights.tolist(),
+            self.losses.severity_class_weights.tolist(),
             "from counts:",
             severity_counts.tolist(),
         )
         print(
             "[Info] Inverse-frequency segmentation weights:",
-            self.segmentation_class_weights.tolist(),
+            self.losses.segmentation_class_weights.tolist(),
             "from voxel counts:",
             segmentation_counts.tolist(),
             f"({valid_segmentation_patients} valid training masks)",
@@ -638,104 +606,7 @@ class TrainingPipeline:
             raise ValueError(f"Unsupported scheduler '{name}'.")
     
     def _compute_losses(self, outputs, batch):
-        segmentation_logits = outputs["segmentation_logits"].float()
-        severity_logits = outputs["severity_logits"].float()
-        segmentation_targets = batch["segmentation"].to(self.device, non_blocking=True)
-        segmentation_valid = batch["segmentation_valid"].to(self.device, non_blocking=True)
-        patient_scores = batch["patient_score"].to(self.device, non_blocking=True)
-
-        if segmentation_valid.any():
-            valid_logits = segmentation_logits[segmentation_valid]
-            valid_targets = segmentation_targets[segmentation_valid]
-            cross_entropy = F.cross_entropy(
-                valid_logits,
-                valid_targets,
-                weight=self.segmentation_class_weights,
-            )
-            probabilities = torch.softmax(valid_logits, dim=1)
-            dice_scores = []
-            for class_index in range(1, self.model.out_channels):
-                class_targets = valid_targets == class_index
-                if class_targets.any():
-                    class_probabilities = probabilities[:, class_index]
-                    intersection = (class_probabilities * class_targets).sum()
-                    denominator = class_probabilities.sum() + class_targets.sum()
-                    dice_scores.append((2 * intersection + 1e-5) / (denominator + 1e-5))
-            dice = torch.stack(dice_scores).mean() if dice_scores else cross_entropy.new_tensor(1.0)
-            segmentation_loss = cross_entropy + (1 - dice)
-        else:
-            segmentation_loss = segmentation_logits.sum() * 0
-            dice = segmentation_loss.detach()
-
-        severity_targets = patient_scores - 1
-        sample_class_weights = (
-            self.severity_class_weights[severity_targets]
-            if self.severity_class_weights is not None
-            else None
-        )
-        if self.classification_loss == "coral":
-            threshold_count = self.model.num_severity_levels - 1
-            thresholds = torch.arange(threshold_count, device=self.device)
-            ordinal_targets = (severity_targets.unsqueeze(1) > thresholds).float()
-            if severity_logits.shape[1] != threshold_count:
-                raise ValueError(
-                    f"CORAL expects {threshold_count} threshold logits, "
-                    f"received {severity_logits.shape[1]}."
-                )
-            per_sample_loss = F.binary_cross_entropy_with_logits(
-                severity_logits,
-                ordinal_targets,
-                reduction="none",
-            ).mean(dim=1)
-            severity_loss = self._weighted_mean(per_sample_loss, sample_class_weights)
-            severity_predictions = (severity_logits > 0).sum(dim=1) + 1
-        elif self.classification_loss == "gaussian":
-            class_indices = torch.arange(
-                self.model.num_severity_levels,
-                device=self.device,
-                dtype=severity_logits.dtype,
-            )
-            gaussian_targets = torch.exp(
-                -0.5
-                * ((class_indices.unsqueeze(0) - severity_targets.unsqueeze(1))
-                   / self.gaussian_sigma) ** 2
-            )
-            gaussian_targets = gaussian_targets / gaussian_targets.sum(
-                dim=1,
-                keepdim=True,
-            )
-            per_sample_loss = -(
-                gaussian_targets * F.log_softmax(severity_logits, dim=1)
-            ).sum(dim=1)
-            severity_loss = self._weighted_mean(per_sample_loss, sample_class_weights)
-            severity_predictions = severity_logits.argmax(dim=1) + 1
-        else:
-            severity_loss = F.cross_entropy(
-                severity_logits,
-                severity_targets,
-                weight=self.severity_class_weights,
-            )
-            severity_predictions = severity_logits.argmax(dim=1) + 1
-
-        severity_mae = (severity_predictions - patient_scores).abs().float().mean()
-        severity_accuracy = (severity_predictions == patient_scores).float().mean()
-        total_loss = self.seg_weight * segmentation_loss + self.cls_weight * severity_loss
-        return {
-            "total": total_loss,
-            "segmentation": segmentation_loss,
-            "severity": severity_loss,
-            "dice": dice,
-            "severity_mae": severity_mae,
-            "severity_accuracy": severity_accuracy,
-        }
-
-    @staticmethod
-    def _weighted_mean(losses, weights):
-        if weights is None:
-            return losses.mean()
-        return (losses * weights).sum() / weights.sum().clamp_min(
-            torch.finfo(losses.dtype).eps
-        )
+        return self.losses(outputs, batch)
 
     def train(self) -> dict:
         """Train full-volume segmentation and patient-level ordinal severity heads."""
@@ -744,9 +615,7 @@ class TrainingPipeline:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
-        if self.segmentation_class_weights is not None:
-            self.segmentation_class_weights = self.segmentation_class_weights.to(self.device)
-            self.severity_class_weights = self.severity_class_weights.to(self.device)
+        self.losses.to(self.device)
         use_mixed_precision = self.mixed_precision and self.device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=use_mixed_precision)
         self.optimizer = optim.Adam(
