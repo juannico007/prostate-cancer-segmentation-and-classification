@@ -1,5 +1,5 @@
 {
-  "experiment_dir": "results/gaussian_loss_segmentation_weight_1.0",
+  "experiment_dir": "results/binary_classification_test/cross_entropy_classifier",
   "data_dir": "Data/resampled_images",
   "data_csv": "Data/data.csv",
   "input_shape": [
@@ -27,11 +27,12 @@
     "classification": 1,
     "segmentation": 1
   },
-  "classification_loss": "gaussian",
+  "classification_loss": "cross_entropy",
   "gaussian_sigma": 1.0,
-  "model_name": "gaussian_loss_segmentation_weight_1.0",
-  "model_version": "0.1",
-  "split": "train",
+  "class_weight_power": 0.5,
+  "model_name": "cross_entropy_classifier",
+  "model_version": "0.3",
+  "split": "val",
   "num_examples": 4,
   "unet": {
     "activation": "relu",
@@ -41,10 +42,10 @@
     "in_channels": 2,
     "n_blocks": 4,
     "normalization": "group4",
-    "num_severity_levels": 5,
+    "num_severity_levels": 2,
     "ordinal_classification": false,
     "out_channels": 4,
     "start_filters": 16,
     "up_mode": "trilinear"
   }
-}
+} 

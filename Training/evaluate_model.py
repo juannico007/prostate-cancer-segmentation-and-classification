@@ -48,6 +48,15 @@ def decode_severity(logits, classification_loss="cross_entropy"):
     return int(logits.float().argmax(dim=-1).item()) + 1
 
 
+def severity_probabilities(logits, classification_loss="cross_entropy"):
+    logits = logits.float()
+    if classification_loss != "coral":
+        return torch.softmax(logits, dim=-1)
+    cumulative_probabilities = torch.sigmoid(logits)
+    cumulative_probabilities = torch.cummin(cumulative_probabilities, dim=-1).values
+    return cumulative_probabilities
+
+
 def plot_confusion_matrix(matrix, output_path, title, labels, axis_label):
     figure, axis = plt.subplots(figsize=(7, 6), constrained_layout=True)
     image = axis.imshow(matrix, cmap="Blues")
@@ -234,19 +243,36 @@ def main():
             output["severity_logits"][0],
             classification_loss,
         )
+        score_probabilities = severity_probabilities(
+            output["severity_logits"][0],
+            classification_loss,
+        ).cpu().tolist()
         true_score = int(batch["patient_score"][0])
         severity_confusion[true_score - 1, predicted_score - 1] += 1
         severity_errors.append(abs(true_score - predicted_score))
         evaluated_patients += 1
 
         segmentation_valid = bool(batch["segmentation_valid"][0])
-        patient_rows.append({
+        patient_row = {
             "patient_id": record.series_id,
             "true_max_score": true_score,
             "predicted_max_score": predicted_score,
             "absolute_score_error": abs(true_score - predicted_score),
             "segmentation_evaluated": segmentation_valid,
+        }
+        patient_row.update({
+            f"probability_score_{score}": probability
+            for score, probability in enumerate(score_probabilities, start=1)
         })
+        patient_rows.append(patient_row)
+        probability_summary = ", ".join(
+            f"{score}: {probability:.3f}"
+            for score, probability in enumerate(score_probabilities, start=1)
+        )
+        print(
+            f"[evaluation] patient {record.series_id}: ground truth={true_score}, "
+            f"predicted={predicted_score}, cumulative probabilities=[{probability_summary}]"
+        )
 
         if segmentation_valid:
             target = batch["segmentation"][0].numpy()
