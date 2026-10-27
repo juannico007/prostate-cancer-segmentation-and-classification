@@ -200,17 +200,36 @@ def main():
     if not records:
         raise ValueError(f"No records selected for split '{selected_split}'.")
     num_examples = args.num_examples if args.num_examples is not None else int(config.get("num_examples", 4))
-    dataset = ProstateDataset(data_dir, records)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     classification_loss = config.get("classification_loss", "cross_entropy")
     model_kwargs = dict(config["unet"])
     model_kwargs["ordinal_classification"] = classification_loss == "coral"
     model = UNet(**model_kwargs).to(device)
-    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if "model_state_dict" in checkpoint:
+        state = checkpoint["model_state_dict"]
+        normalization_stats = checkpoint.get("normalization_stats")
+        if normalization_stats is None:
+            raise ValueError(
+                f"Checkpoint is missing normalization parameters: {checkpoint_path}"
+            )
+    else:
+        state = checkpoint
+        normalization_stats = None
+        print(
+            "[Warning] Legacy checkpoint has no normalization parameters; "
+            "evaluating without input normalization."
+        )
     model.load_state_dict(state)
     model.eval()
     use_amp = device.type == "cuda" and bool(config.get("mixed_precision", True))
+    dataset = ProstateDataset(
+        data_dir,
+        records,
+        normalization_stats=normalization_stats,
+    )
+    if normalization_stats is not None:
+        print(f"Using training-set normalization parameters: {normalization_stats}")
 
     severity_levels = model.num_severity_levels
     severity_confusion = np.zeros((severity_levels, severity_levels), dtype=np.int64)

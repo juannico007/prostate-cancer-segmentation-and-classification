@@ -169,10 +169,35 @@ class ProstateDataset(Dataset):
     def __init__(
         self,
         nii_path: Path,
-        records: List[Record]
+        records: List[Record],
+        normalization_stats: Optional[Dict[str, Dict[str, float]]] = None,
     ):
         self.nii_path = str(nii_path)
         self.records = records
+        if normalization_stats is not None:
+            validated_stats = {}
+            for modality in ("mri", "pet"):
+                modality_stats = normalization_stats.get(modality)
+                if not isinstance(modality_stats, dict):
+                    raise ValueError(
+                        f"Normalization parameters are missing for {modality.upper()}."
+                    )
+                try:
+                    mean = float(modality_stats["mean"])
+                    std = float(modality_stats["std"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Invalid normalization parameters for {modality.upper()}."
+                    ) from error
+                if not np.isfinite(mean) or not np.isfinite(std) or std <= 0:
+                    raise ValueError(
+                        f"Normalization mean/std for {modality.upper()} must be finite "
+                        "and std must be greater than zero."
+                    )
+                validated_stats[modality] = {"mean": mean, "std": std}
+            self.normalization_stats = validated_stats
+        else:
+            self.normalization_stats = None
     def __len__(self):
         return len(self.records)
 
@@ -202,6 +227,46 @@ class ProstateDataset(Dataset):
 
         return pet_image, mri_image
 
+    def compute_normalization_stats(self) -> Dict[str, Dict[str, float]]:
+        """Calculate voxel-weighted population mean and standard deviation per modality."""
+        accumulators = {
+            "mri": {"count": 0, "mean": 0.0, "m2": 0.0},
+            "pet": {"count": 0, "mean": 0.0, "m2": 0.0},
+        }
+        for record in self.records:
+            patient_path = Path(self.nii_path) / str(record.series_id)
+            pet_volume, mri_volume = self._get_volumes(patient_path)
+            for modality, volume in (("mri", mri_volume), ("pet", pet_volume)):
+                values = np.asarray(volume, dtype=np.float64)
+                if values.size == 0 or not np.isfinite(values).all():
+                    raise ValueError(
+                        f"Patient {record.series_id} has empty or non-finite {modality.upper()} data."
+                    )
+
+                batch_count = int(values.size)
+                batch_mean = float(values.mean())
+                batch_m2 = float(values.var() * batch_count)
+                accumulator = accumulators[modality]
+                total_count = accumulator["count"] + batch_count
+                delta = batch_mean - accumulator["mean"]
+                accumulator["m2"] += (
+                    batch_m2
+                    + delta * delta * accumulator["count"] * batch_count / total_count
+                )
+                accumulator["mean"] += delta * batch_count / total_count
+                accumulator["count"] = total_count
+
+        stats = {}
+        for modality, accumulator in accumulators.items():
+            if accumulator["count"] == 0:
+                raise ValueError(f"No training {modality.upper()} voxels were available for normalization.")
+            std = float(np.sqrt(accumulator["m2"] / accumulator["count"]))
+            stats[modality] = {
+                "mean": float(accumulator["mean"]),
+                "std": std if std > 0 else 1.0,
+            }
+        return stats
+
     def _get_lesion_mask(self, patient_path, lesion_id):
         lesion_paths = list(
             patient_path.rglob(f"*Lesion_{lesion_id}.nii.gz")
@@ -226,6 +291,15 @@ class ProstateDataset(Dataset):
         patient_path = Path(self.nii_path) / patient
 
         pet_volume, mri_volume = self._get_volumes(patient_path)
+        if self.normalization_stats is not None:
+            mri_stats = self.normalization_stats["mri"]
+            pet_stats = self.normalization_stats["pet"]
+            mri_volume = (
+                np.asarray(mri_volume, dtype=np.float32) - mri_stats["mean"]
+            ) / mri_stats["std"]
+            pet_volume = (
+                np.asarray(pet_volume, dtype=np.float32) - pet_stats["mean"]
+            ) / pet_stats["std"]
 
         targets = []
         segmentation_target = np.zeros(mri_volume.shape, dtype=np.int64)
@@ -404,6 +478,7 @@ class TrainingPipeline:
             gaussian_sigma=gaussian_sigma,
             class_weight_power=class_weight_power,
         )
+        self.normalization_stats: Optional[Dict[str, Dict[str, float]]] = None
 
         self.scheduler_step_mode: Optional[str] = None
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
@@ -470,11 +545,14 @@ class TrainingPipeline:
             nii_path=nii_path,
             records=train_records,
         )
+        self.normalization_stats = train_dataset.compute_normalization_stats()
+        train_dataset.normalization_stats = self.normalization_stats
         if self.losses.class_weight_power is not None:
             self._configure_class_weights(train_dataset)
         val_dataset = ProstateDataset(
             nii_path=nii_path,
             records=val_records,
+            normalization_stats=self.normalization_stats,
         )
 
         train_loader = DataLoader(
@@ -698,7 +776,13 @@ class TrainingPipeline:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 Path(self.checkpoint_path).parent.mkdir(parents=True, exist_ok=True)
-                torch.save(self.model.state_dict(), self.checkpoint_path)
+                torch.save(
+                    {
+                        "model_state_dict": self.model.state_dict(),
+                        "normalization_stats": self.normalization_stats,
+                    },
+                    self.checkpoint_path,
+                )
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1

@@ -155,6 +155,11 @@ def main():
         splits=splits,
     )
 
+    normalization_path = experiment_dir / f"{artifact_id}_normalization.json"
+    with normalization_path.open("w", encoding="utf-8") as handle:
+        json.dump(pipeline.normalization_stats, handle, indent=2, sort_keys=True)
+    print(f"Normalization parameters saved to {normalization_path}")
+
     print("\n[5/5] Training model...")
     history = pipeline.train()
 
@@ -184,6 +189,7 @@ def main():
                 "checkpoint": str(checkpoint_path.relative_to(experiment_dir)),
                 "history": str(history_path.relative_to(experiment_dir)),
                 "hyperparameters": hyperparams_path.name,
+                "normalization": normalization_path.name,
                 "split_manifests": {
                     name: str(path.relative_to(experiment_dir))
                     for name, path in split_csv_paths.items()
