@@ -12,7 +12,12 @@ import itk
 import torch
 
 from model import UNet
-from training_pipeline import ProstateDataset, collate_fn, load_records
+from training_pipeline import (
+    CLASSIFICATION_TARGETS,
+    ProstateDataset,
+    collate_fn,
+    load_records,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +27,7 @@ SEGMENTATION_LABELS = ("background", "score_3", "score_4", "score_5")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate patient severity and four-class segmentation; save case visualizations."
+        description="Evaluate patient classification and four-class segmentation; save case visualizations."
     )
     parser.add_argument(
         "--checkpoint",
@@ -44,8 +49,8 @@ def parse_args():
 
 def decode_severity(logits, classification_loss="cross_entropy"):
     if classification_loss == "coral":
-        return int((logits.float() > 0).sum().item()) + 1
-    return int(logits.float().argmax(dim=-1).item()) + 1
+        return int((logits.float() > 0).sum().item())
+    return int(logits.float().argmax(dim=-1).item())
 
 
 def severity_probabilities(logits, classification_loss="cross_entropy"):
@@ -54,7 +59,14 @@ def severity_probabilities(logits, classification_loss="cross_entropy"):
         return torch.softmax(logits, dim=-1)
     cumulative_probabilities = torch.sigmoid(logits)
     cumulative_probabilities = torch.cummin(cumulative_probabilities, dim=-1).values
-    return cumulative_probabilities
+    return torch.cat(
+        (
+            1 - cumulative_probabilities[..., :1],
+            cumulative_probabilities[..., :-1] - cumulative_probabilities[..., 1:],
+            cumulative_probabilities[..., -1:],
+        ),
+        dim=-1,
+    )
 
 
 def plot_confusion_matrix(matrix, output_path, title, labels, axis_label):
@@ -200,23 +212,36 @@ def main():
     if not records:
         raise ValueError(f"No records selected for split '{selected_split}'.")
     num_examples = args.num_examples if args.num_examples is not None else int(config.get("num_examples", 4))
-    dataset = ProstateDataset(data_dir, records)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     classification_loss = config.get("classification_loss", "cross_entropy")
+    classification_target = config.get("classification_target", "primary_grade")
+    if classification_target not in CLASSIFICATION_TARGETS:
+        raise ValueError(
+            f"classification_target must be one of {', '.join(CLASSIFICATION_TARGETS)}."
+        )
     model_kwargs = dict(config["unet"])
     model_kwargs["ordinal_classification"] = classification_loss == "coral"
+    if classification_target == "binary_primary_3" and model_kwargs["num_severity_levels"] != 2:
+        raise ValueError("binary_primary_3 classification requires num_severity_levels=2.")
+    dataset = ProstateDataset(
+        data_dir,
+        records,
+        classification_target=classification_target,
+    )
     model = UNet(**model_kwargs).to(device)
     state = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.eval()
     use_amp = device.type == "cuda" and bool(config.get("mixed_precision", True))
 
-    severity_levels = model.num_severity_levels
-    severity_confusion = np.zeros((severity_levels, severity_levels), dtype=np.int64)
+    classification_levels = model.num_severity_levels
+    classification_confusion = np.zeros(
+        (classification_levels, classification_levels),
+        dtype=np.int64,
+    )
     segmentation_confusion = np.zeros((model.out_channels, model.out_channels), dtype=np.int64)
     patient_rows = []
-    severity_errors = []
+    classification_errors = []
     evaluated_patients = 0
     segmentation_patients = 0
     skipped_patients = 0
@@ -239,44 +264,49 @@ def main():
         with torch.inference_mode():
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 output = model(image)
-        predicted_score = decode_severity(
+        predicted_class = decode_severity(
             output["severity_logits"][0],
             classification_loss,
         )
-        score_probabilities = severity_probabilities(
+        class_probabilities = severity_probabilities(
             output["severity_logits"][0],
             classification_loss,
         ).cpu().tolist()
         true_score = int(batch["patient_score"][0])
-        severity_confusion[true_score - 1, predicted_score - 1] += 1
-        severity_errors.append(abs(true_score - predicted_score))
+        true_class = int(batch["classification_target"][0])
+        classification_confusion[true_class, predicted_class] += 1
+        classification_errors.append(abs(true_class - predicted_class))
         evaluated_patients += 1
 
         segmentation_valid = bool(batch["segmentation_valid"][0])
         patient_row = {
             "patient_id": record.series_id,
             "true_max_score": true_score,
-            "predicted_max_score": predicted_score,
-            "absolute_score_error": abs(true_score - predicted_score),
+            "true_classification_label": true_class,
+            "predicted_classification_label": predicted_class,
+            "absolute_classification_error": abs(true_class - predicted_class),
             "segmentation_evaluated": segmentation_valid,
         }
         patient_row.update({
-            f"probability_score_{score}": probability
-            for score, probability in enumerate(score_probabilities, start=1)
+            f"probability_class_{class_index}": probability
+            for class_index, probability in enumerate(class_probabilities)
         })
+        if classification_target == "primary_grade":
+            patient_row["predicted_max_score"] = predicted_class + 1
         patient_rows.append(patient_row)
         probability_summary = ", ".join(
-            f"{score}: {probability:.3f}"
-            for score, probability in enumerate(score_probabilities, start=1)
+            f"{class_index}: {probability:.3f}"
+            for class_index, probability in enumerate(class_probabilities)
         )
         print(
-            f"[evaluation] patient {record.series_id}: ground truth={true_score}, "
-            f"predicted={predicted_score}, cumulative probabilities=[{probability_summary}]"
+            f"[evaluation] patient {record.series_id}: max PRIMARY={true_score}, "
+            f"class={true_class}, predicted class={predicted_class}, "
+            f"class probabilities=[{probability_summary}]"
         )
 
+        prediction = output["segmentation_logits"].argmax(dim=1)[0].cpu().numpy()
         if segmentation_valid:
             target = batch["segmentation"][0].numpy()
-            prediction = output["segmentation_logits"].argmax(dim=1)[0].cpu().numpy()
             encoded_pairs = target.reshape(-1) * model.out_channels + prediction.reshape(-1)
             segmentation_confusion += np.bincount(
                 encoded_pairs,
@@ -284,7 +314,7 @@ def main():
             ).reshape(model.out_channels, model.out_channels)
             segmentation_patients += 1
         else:
-            print(f"[info] patient {record.series_id}: severity evaluated; incomplete score 3-5 masks excluded from segmentation metrics")
+            print(f"[info] patient {record.series_id}: classification evaluated; incomplete score 3-5 masks excluded from segmentation metrics")
 
         if example_count < num_examples:
             patient_path = data_dir / str(record.series_id)
@@ -303,7 +333,13 @@ def main():
     if not evaluated_patients:
         raise RuntimeError("No patients with readable MRI and PET volumes were available for evaluation.")
 
-    severity_errors = np.asarray(severity_errors)
+    classification_errors = np.asarray(classification_errors)
+    if classification_target == "binary_primary_3":
+        classification_label_names = ["below_primary_3", "primary_3_to_5"]
+    else:
+        classification_label_names = [
+            str(score) for score in range(1, classification_levels + 1)
+        ]
     metrics = {
         "checkpoint": str(checkpoint_path),
         "split": selected_split,
@@ -312,12 +348,19 @@ def main():
         "evaluated_patients": evaluated_patients,
         "segmentation_patients": segmentation_patients,
         "skipped_patients": skipped_patients,
-        "patient_severity": {
-            "accuracy": float(np.trace(severity_confusion) / severity_confusion.sum()),
-            "mean_absolute_error": float(severity_errors.mean()),
-            "within_one_grade": float(np.mean(severity_errors <= 1)),
-            "confusion_matrix_labels": list(range(1, severity_levels + 1)),
-            "confusion_matrix": severity_confusion.tolist(),
+        "classification_target": classification_target,
+        "patient_classification": {
+            "accuracy": float(
+                np.trace(classification_confusion) / classification_confusion.sum()
+            ),
+            "mean_absolute_error": float(classification_errors.mean()),
+            "confusion_matrix_labels": (
+                list(range(classification_levels))
+                if classification_target == "binary_primary_3"
+                else list(range(1, classification_levels + 1))
+            ),
+            "confusion_matrix_label_names": classification_label_names,
+            "confusion_matrix": classification_confusion.tolist(),
         },
         "segmentation": {
             "class_labels": list(SEGMENTATION_LABELS),
@@ -325,6 +368,10 @@ def main():
             "classes": segmentation_metrics(segmentation_confusion),
         },
     }
+    if classification_target == "primary_grade":
+        metrics["patient_classification"]["within_one_grade"] = float(
+            np.mean(classification_errors <= 1)
+        )
 
     metrics_path = output_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as stream:
@@ -335,12 +382,17 @@ def main():
         writer.writeheader()
         writer.writerows(patient_rows)
 
+    plot_labels = (
+        ["0: below PRIMARY 3", "1: PRIMARY 3-5"]
+        if classification_target == "binary_primary_3"
+        else classification_label_names
+    )
     plot_confusion_matrix(
-        severity_confusion,
-        output_dir / "patient_severity_confusion_matrix.png",
-        "Patient maximum primary score",
-        list(range(1, severity_levels + 1)),
-        "score",
+        classification_confusion,
+        output_dir / "patient_classification_confusion_matrix.png",
+        "Patient classification",
+        plot_labels,
+        "class",
     )
     plot_confusion_matrix(
         segmentation_confusion,
@@ -351,8 +403,14 @@ def main():
     )
 
     print(f"Evaluated {evaluated_patients} patients; segmentation evaluated on {segmentation_patients}; skipped {skipped_patients}.")
-    print(f"Patient severity accuracy: {metrics['patient_severity']['accuracy']:.3f}")
-    print(f"Patient severity MAE: {metrics['patient_severity']['mean_absolute_error']:.3f}")
+    print(
+        "Patient classification accuracy: "
+        f"{metrics['patient_classification']['accuracy']:.3f}"
+    )
+    print(
+        "Patient classification MAE: "
+        f"{metrics['patient_classification']['mean_absolute_error']:.3f}"
+    )
     print(f"Mean foreground segmentation Dice: {metrics['segmentation']['classes']['mean_foreground_dice']}")
     print(f"Saved metrics: {metrics_path}")
     print(f"Saved patient predictions: {predictions_path}")

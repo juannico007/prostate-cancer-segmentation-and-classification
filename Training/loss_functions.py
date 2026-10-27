@@ -97,8 +97,8 @@ class TrainingLosses(nn.Module):
         dice = torch.stack(dice_scores).mean() if dice_scores else cross_entropy.new_tensor(1.0)
         return cross_entropy + (1 - dice), dice
 
-    def _classification_loss(self, logits, patient_scores):
-        targets = patient_scores - 1
+    def _classification_loss(self, logits, classification_targets):
+        targets = classification_targets
         sample_weights = (
             self.severity_class_weights[targets]
             if self.severity_class_weights is not None
@@ -120,7 +120,7 @@ class TrainingLosses(nn.Module):
                 reduction="none",
             ).mean(dim=1)
             loss = self._weighted_mean(per_sample_loss, sample_weights)
-            predictions = (logits > 0).sum(dim=1) + 1
+            predictions = (logits > 0).sum(dim=1)
         elif self.classification_loss == "gaussian":
             class_indices = torch.arange(
                 self.severity_levels,
@@ -140,14 +140,14 @@ class TrainingLosses(nn.Module):
                 gaussian_targets * F.log_softmax(logits, dim=1)
             ).sum(dim=1)
             loss = self._weighted_mean(per_sample_loss, sample_weights)
-            predictions = logits.argmax(dim=1) + 1
+            predictions = logits.argmax(dim=1)
         else:
             loss = F.cross_entropy(
                 logits,
                 targets,
                 weight=self.severity_class_weights,
             )
-            predictions = logits.argmax(dim=1) + 1
+            predictions = logits.argmax(dim=1)
 
         return loss, predictions
 
@@ -162,7 +162,7 @@ class TrainingLosses(nn.Module):
             segmentation_logits.device,
             non_blocking=True,
         )
-        patient_scores = batch["patient_score"].to(
+        classification_targets = batch["classification_target"].to(
             severity_logits.device,
             non_blocking=True,
         )
@@ -174,10 +174,14 @@ class TrainingLosses(nn.Module):
         )
         severity_loss, severity_predictions = self._classification_loss(
             severity_logits,
-            patient_scores,
+            classification_targets,
         )
-        severity_mae = (severity_predictions - patient_scores).abs().float().mean()
-        severity_accuracy = (severity_predictions == patient_scores).float().mean()
+        severity_mae = (
+            severity_predictions - classification_targets
+        ).abs().float().mean()
+        severity_accuracy = (
+            severity_predictions == classification_targets
+        ).float().mean()
         total_loss = (
             self.segmentation_weight * segmentation_loss
             + self.classification_weight * severity_loss

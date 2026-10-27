@@ -16,6 +16,20 @@ import os
 from loss_functions import TrainingLosses
 
 
+CLASSIFICATION_TARGETS = ("primary_grade", "binary_primary_3")
+
+
+def classification_class(score: int, target: str) -> int:
+    if target == "primary_grade":
+        return score - 1
+    if target == "binary_primary_3":
+        return int(score >= 3)
+    raise ValueError(
+        f"Unsupported classification_target '{target}'; "
+        f"expected one of {', '.join(CLASSIFICATION_TARGETS)}."
+    )
+
+
 @dataclass
 class LesionRecord:
     lesion_id: int
@@ -169,10 +183,16 @@ class ProstateDataset(Dataset):
     def __init__(
         self,
         nii_path: Path,
-        records: List[Record]
+        records: List[Record],
+        classification_target: str = "primary_grade",
     ):
         self.nii_path = str(nii_path)
         self.records = records
+        if classification_target not in CLASSIFICATION_TARGETS:
+            raise ValueError(
+                f"classification_target must be one of {', '.join(CLASSIFICATION_TARGETS)}."
+            )
+        self.classification_target = classification_target
     def __len__(self):
         return len(self.records)
 
@@ -276,6 +296,7 @@ class ProstateDataset(Dataset):
             targets.append({
                 "lesion_id": lesion.lesion_id,
                 "label": lesion.label,
+                "classification_label": int(lesion.label >= 3),
                 "mask": mask,
                 "bbox": np.array([
                     lesion.z_min,
@@ -295,6 +316,10 @@ class ProstateDataset(Dataset):
             "segmentation": segmentation_target,
             "segmentation_valid": segmentation_valid,
             "patient_score": max(lesion.label for lesion in record.lesions),
+            "classification_target": classification_class(
+                max(lesion.label for lesion in record.lesions),
+                self.classification_target,
+            ),
         }
 
 def collate_fn(batch):
@@ -325,6 +350,9 @@ def collate_fn(batch):
         "patient_score": torch.tensor(
             [item["patient_score"] for item in batch], dtype=torch.long
         ),
+        "classification_target": torch.tensor(
+            [item["classification_target"] for item in batch], dtype=torch.long
+        ),
     }
 
 
@@ -351,6 +379,7 @@ class TrainingPipeline:
         scheduler_config: Optional[Dict[str, Any]] = None,
         loss_weights: Optional[Dict[str, float]] = None,
         classification_loss: str = "cross_entropy",
+        classification_target: str = "primary_grade",
         gaussian_sigma: float = 1.0,
         mixed_precision: bool = True,
         gradient_accumulation_steps: int = 1,
@@ -388,6 +417,15 @@ class TrainingPipeline:
         self.validation_ratio = validation_ratio
         self.test_ratio = test_ratio
         self.split_seed = split_seed
+        if classification_target not in CLASSIFICATION_TARGETS:
+            raise ValueError(
+                f"classification_target must be one of {', '.join(CLASSIFICATION_TARGETS)}."
+            )
+        if classification_target == "binary_primary_3" and model.num_severity_levels != 2:
+            raise ValueError(
+                "binary_primary_3 classification requires num_severity_levels=2."
+            )
+        self.classification_target = classification_target
         self.mixed_precision = mixed_precision
         self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
         self.num_workers = max(0, int(num_workers))
@@ -436,7 +474,11 @@ class TrainingPipeline:
         if not records:
             raise ValueError(f"No patch records found in {data_csv}")
 
-        volume_check = ProstateDataset(nii_path=nii_path, records=records)
+        volume_check = ProstateDataset(
+            nii_path=nii_path,
+            records=records,
+            classification_target=self.classification_target,
+        )
 
         if splits is None:
             splits = split_records(
@@ -469,12 +511,14 @@ class TrainingPipeline:
         train_dataset = ProstateDataset(
             nii_path=nii_path,
             records=train_records,
+            classification_target=self.classification_target,
         )
         if self.losses.class_weight_power is not None:
             self._configure_class_weights(train_dataset)
         val_dataset = ProstateDataset(
             nii_path=nii_path,
             records=val_records,
+            classification_target=self.classification_target,
         )
 
         train_loader = DataLoader(
@@ -504,12 +548,13 @@ class TrainingPipeline:
         severity_counts = np.zeros(self.model.num_severity_levels, dtype=np.int64)
         for record in train_dataset.records:
             score = max(lesion.label for lesion in record.lesions)
-            if score < 1 or score > self.model.num_severity_levels:
+            class_index = classification_class(score, self.classification_target)
+            if class_index < 0 or class_index >= self.model.num_severity_levels:
                 raise ValueError(
-                    f"Patient {record.series_id} has score {score}, outside the model's "
-                    f"1-{self.model.num_severity_levels} severity levels."
+                    f"Patient {record.series_id} has classification class {class_index}, "
+                    f"outside the model's 0-{self.model.num_severity_levels - 1} output classes."
                 )
-            severity_counts[score - 1] += 1
+            severity_counts[class_index] += 1
 
         segmentation_counts = np.zeros(self.model.out_channels, dtype=np.int64)
         valid_segmentation_patients = 0

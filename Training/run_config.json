@@ -28,6 +28,7 @@
     "segmentation": 1
   },
   "classification_loss": "cross_entropy",
+  "classification_target": "binary_primary_3",
   "gaussian_sigma": 1.0,
   "class_weight_power": 0.5,
   "model_name": "cross_entropy_classifier",

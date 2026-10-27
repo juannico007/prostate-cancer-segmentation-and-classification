@@ -8,7 +8,13 @@ import json
 from datetime import datetime
 import numpy as np
 from model import UNet
-from training_pipeline import TrainingPipeline, load_records, split_records, write_split_csvs
+from training_pipeline import (
+    CLASSIFICATION_TARGETS,
+    TrainingPipeline,
+    load_records,
+    split_records,
+    write_split_csvs,
+)
 import pandas as pd
 
 
@@ -29,6 +35,11 @@ def main():
         "--classification-loss",
         choices=("cross_entropy", "coral", "gaussian"),
         help="Classification objective; defaults to the value in the config file.",
+    )
+    parser.add_argument(
+        "--classification-target",
+        choices=CLASSIFICATION_TARGETS,
+        help="Patient target mapping; defaults to the value in the config file.",
     )
     parser.add_argument(
         "--gaussian-sigma",
@@ -52,6 +63,9 @@ def main():
     classification_loss = args.classification_loss or hyperparams.get(
         "classification_loss", "cross_entropy"
     )
+    classification_target = args.classification_target or hyperparams.get(
+        "classification_target", "primary_grade"
+    )
     gaussian_sigma = (
         args.gaussian_sigma
         if args.gaussian_sigma is not None
@@ -65,6 +79,7 @@ def main():
     if class_weight_power is not None and class_weight_power <= 0:
         raise ValueError("class_weight_power must be greater than zero or null.")
     hyperparams["classification_loss"] = classification_loss
+    hyperparams["classification_target"] = classification_target
     hyperparams["gaussian_sigma"] = gaussian_sigma
     hyperparams["class_weight_power"] = class_weight_power
     model_name = hyperparams["model_name"]
@@ -136,6 +151,7 @@ def main():
         scheduler_config=hyperparams["scheduler"],
         loss_weights=hyperparams.get("loss_weights"),
         classification_loss=classification_loss,
+        classification_target=classification_target,
         gaussian_sigma=gaussian_sigma,
         class_weight_power=class_weight_power,
         mixed_precision=hyperparams["mixed_precision"],
