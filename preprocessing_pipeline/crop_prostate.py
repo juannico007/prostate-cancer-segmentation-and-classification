@@ -25,7 +25,7 @@ def segment_prostate(patient_id, scan_folder, patient_output_folder):
     np.ndarray
         A binary mask of the segmented prostate.
     """
-    input_image_path = next(Path(patient_folder).rglob("*MRI_T2.nii.gz"), None)
+    input_image_path = os.path.join(scan_folder, f"study_{patient_id}_MRI_T2.nii.gz")
     command = f"TotalSegmentator -i {input_image_path} -o {patient_output_folder} --task total_mr"
     subprocess.run(command, shell=True, check=True)
 
@@ -73,7 +73,7 @@ def crop_prostate(image, mask, resolution = 256):
     min_coords = np.maximum(min_coords, 0)
     max_coords = np.minimum(max_coords, shape)
 
-    # Convert to ITK order (x, y, z)
+    # Get start and size for the region of interest in ITK's coordinate system 
     start = min_coords[::-1].astype(int).tolist()
     size = (max_coords - min_coords)[::-1].astype(int).tolist()
 
@@ -97,7 +97,7 @@ for patient in tqdm(os.listdir(nii_images)):
     os.makedirs(output_folder, exist_ok=True)
 
     # Load the MRI image
-    mri_image_path = next(Path(patient_folder).rglob("*MRI_T2.nii.gz"), None)
+    mri_image_path = os.path.join(patient_folder, f"study_{patient}_MRI_T2.nii.gz")
     if mri_image_path is None:
         print(f"No MRI image found for patient {patient}. Skipping.")
         continue
