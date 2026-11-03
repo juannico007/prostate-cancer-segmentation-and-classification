@@ -3,13 +3,10 @@ from pathlib import Path
 import pickle
 import torch
 import os
-import torch.distributed as dist
 import json
 from datetime import datetime
-import numpy as np
 from model import UNet
 from training_pipeline import TrainingPipeline, load_records, split_records, write_split_csvs
-import pandas as pd
 
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -18,22 +15,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 def main():
-    parser = argparse.ArgumentParser(description="Train the prostate cancer segmentation and classification model.")
+    parser = argparse.ArgumentParser(description="Train the prostate cancer segmentation model.")
     parser.add_argument(
         "--config",
         type=Path,
         default=REPO_ROOT / "Training/run_config.json",
         help="JSON config shared with Training/evaluate_model.py.",
-    )
-    parser.add_argument(
-        "--classification-loss",
-        choices=("cross_entropy", "coral", "gaussian"),
-        help="Classification objective; defaults to the value in the config file.",
-    )
-    parser.add_argument(
-        "--gaussian-sigma",
-        type=float,
-        help="Standard deviation for Gaussian soft targets.",
     )
     parser.add_argument(
         "--class-weight-power",
@@ -49,14 +36,6 @@ def main():
         path = Path(path)
         return (path if path.is_absolute() else REPO_ROOT / path).resolve()
 
-    classification_loss = args.classification_loss or hyperparams.get(
-        "classification_loss", "cross_entropy"
-    )
-    gaussian_sigma = (
-        args.gaussian_sigma
-        if args.gaussian_sigma is not None
-        else float(hyperparams.get("gaussian_sigma", 1.0))
-    )
     class_weight_power = (
         args.class_weight_power
         if args.class_weight_power is not None
@@ -67,8 +46,6 @@ def main():
         raise ValueError("grouped_normalization must be a boolean in the config file.")
     if class_weight_power is not None and class_weight_power <= 0:
         raise ValueError("class_weight_power must be greater than zero or null.")
-    hyperparams["classification_loss"] = classification_loss
-    hyperparams["gaussian_sigma"] = gaussian_sigma
     hyperparams["class_weight_power"] = class_weight_power
     model_name = hyperparams["model_name"]
     model_version = hyperparams["model_version"]
@@ -118,8 +95,6 @@ def main():
     print("\n[2/5] Building model...")
 
     unet_kwargs = dict(hyperparams.get("unet", {}))
-    unet_kwargs["ordinal_classification"] = classification_loss == "coral"
-    hyperparams["unet"] = unet_kwargs
     model = UNet(**unet_kwargs).to(device)
 
     print("\n[3/5] Setting up training pipeline...")
@@ -138,8 +113,6 @@ def main():
         split_seed=hyperparams.get("split_seed", 42),
         scheduler_config=hyperparams["scheduler"],
         loss_weights=hyperparams.get("loss_weights"),
-        classification_loss=classification_loss,
-        gaussian_sigma=gaussian_sigma,
         class_weight_power=class_weight_power,
         mixed_precision=hyperparams["mixed_precision"],
         gradient_accumulation_steps=hyperparams["gradient_accumulation_steps"],

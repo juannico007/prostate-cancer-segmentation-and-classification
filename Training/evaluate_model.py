@@ -1,5 +1,4 @@
 import argparse
-import csv
 import json
 import pickle
 from pathlib import Path
@@ -22,7 +21,7 @@ SEGMENTATION_LABELS = ("background", "score_3", "score_4", "score_5")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate patient severity and four-class segmentation; save case visualizations."
+        description="Evaluate four-class segmentation and save case visualizations."
     )
     parser.add_argument(
         "--checkpoint",
@@ -40,21 +39,6 @@ def parse_args():
     parser.add_argument("--split", choices=("val", "train", "test", "all"))
     parser.add_argument("--num-examples", type=int)
     return parser.parse_args()
-
-
-def decode_severity(logits, classification_loss="cross_entropy"):
-    if classification_loss == "coral":
-        return int((logits.float() > 0).sum().item()) + 1
-    return int(logits.float().argmax(dim=-1).item()) + 1
-
-
-def severity_probabilities(logits, classification_loss="cross_entropy"):
-    logits = logits.float()
-    if classification_loss != "coral":
-        return torch.softmax(logits, dim=-1)
-    cumulative_probabilities = torch.sigmoid(logits)
-    cumulative_probabilities = torch.cummin(cumulative_probabilities, dim=-1).values
-    return cumulative_probabilities
 
 
 def plot_confusion_matrix(matrix, output_path, title, labels, axis_label):
@@ -86,9 +70,8 @@ def plot_loss_curves(history_path, output_path):
     loss_groups = (
         ("total", "Total loss"),
         ("segmentation", "Segmentation loss"),
-        ("severity", "Patient score loss"),
     )
-    figure, axes = plt.subplots(1, len(loss_groups), figsize=(15, 4.5), constrained_layout=True)
+    figure, axes = plt.subplots(1, len(loss_groups), figsize=(10, 4.5), constrained_layout=True)
     for axis, (key, title) in zip(axes, loss_groups):
         plotted = False
         for split, label in (("train", "Train"), ("val", "Validation")):
@@ -204,10 +187,7 @@ def main():
         raise ValueError(f"No records selected for split '{selected_split}'.")
     num_examples = args.num_examples if args.num_examples is not None else int(config.get("num_examples", 4))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    classification_loss = config.get("classification_loss", "cross_entropy")
-    model_kwargs = dict(config["unet"])
-    model_kwargs["ordinal_classification"] = classification_loss == "coral"
-    model = UNet(**model_kwargs).to(device)
+    model = UNet(**config["unet"]).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if "model_state_dict" in checkpoint:
         state = checkpoint["model_state_dict"]
@@ -238,11 +218,7 @@ def main():
     elif not grouped_normalization:
         print("Grouped training-set normalization is disabled.")
 
-    severity_levels = model.num_severity_levels
-    severity_confusion = np.zeros((severity_levels, severity_levels), dtype=np.int64)
     segmentation_confusion = np.zeros((model.out_channels, model.out_channels), dtype=np.int64)
-    patient_rows = []
-    severity_errors = []
     evaluated_patients = 0
     segmentation_patients = 0
     skipped_patients = 0
@@ -265,44 +241,13 @@ def main():
         with torch.inference_mode():
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 output = model(image)
-        predicted_score = decode_severity(
-            output["severity_logits"][0],
-            classification_loss,
-        )
-        score_probabilities = severity_probabilities(
-            output["severity_logits"][0],
-            classification_loss,
-        ).cpu().tolist()
-        true_score = int(batch["patient_score"][0])
-        severity_confusion[true_score - 1, predicted_score - 1] += 1
-        severity_errors.append(abs(true_score - predicted_score))
         evaluated_patients += 1
 
         segmentation_valid = bool(batch["segmentation_valid"][0])
-        patient_row = {
-            "patient_id": record.series_id,
-            "true_max_score": true_score,
-            "predicted_max_score": predicted_score,
-            "absolute_score_error": abs(true_score - predicted_score),
-            "segmentation_evaluated": segmentation_valid,
-        }
-        patient_row.update({
-            f"probability_score_{score}": probability
-            for score, probability in enumerate(score_probabilities, start=1)
-        })
-        patient_rows.append(patient_row)
-        probability_summary = ", ".join(
-            f"{score}: {probability:.3f}"
-            for score, probability in enumerate(score_probabilities, start=1)
-        )
-        print(
-            f"[evaluation] patient {record.series_id}: ground truth={true_score}, "
-            f"predicted={predicted_score}, cumulative probabilities=[{probability_summary}]"
-        )
+        prediction = output["segmentation_logits"].argmax(dim=1)[0].cpu().numpy()
 
         if segmentation_valid:
             target = batch["segmentation"][0].numpy()
-            prediction = output["segmentation_logits"].argmax(dim=1)[0].cpu().numpy()
             encoded_pairs = target.reshape(-1) * model.out_channels + prediction.reshape(-1)
             segmentation_confusion += np.bincount(
                 encoded_pairs,
@@ -310,7 +255,7 @@ def main():
             ).reshape(model.out_channels, model.out_channels)
             segmentation_patients += 1
         else:
-            print(f"[info] patient {record.series_id}: severity evaluated; incomplete score 3-5 masks excluded from segmentation metrics")
+            print(f"[info] patient {record.series_id}: incomplete score 3-5 masks excluded from segmentation metrics")
 
         if example_count < num_examples:
             patient_path = data_dir / str(record.series_id)
@@ -329,7 +274,6 @@ def main():
     if not evaluated_patients:
         raise RuntimeError("No patients with readable MRI and PET volumes were available for evaluation.")
 
-    severity_errors = np.asarray(severity_errors)
     metrics = {
         "checkpoint": str(checkpoint_path),
         "split": selected_split,
@@ -338,13 +282,6 @@ def main():
         "evaluated_patients": evaluated_patients,
         "segmentation_patients": segmentation_patients,
         "skipped_patients": skipped_patients,
-        "patient_severity": {
-            "accuracy": float(np.trace(severity_confusion) / severity_confusion.sum()),
-            "mean_absolute_error": float(severity_errors.mean()),
-            "within_one_grade": float(np.mean(severity_errors <= 1)),
-            "confusion_matrix_labels": list(range(1, severity_levels + 1)),
-            "confusion_matrix": severity_confusion.tolist(),
-        },
         "segmentation": {
             "class_labels": list(SEGMENTATION_LABELS),
             "confusion_matrix": segmentation_confusion.tolist(),
@@ -355,19 +292,6 @@ def main():
     metrics_path = output_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as stream:
         json.dump(metrics, stream, indent=2)
-    predictions_path = output_dir / "patient_predictions.csv"
-    with predictions_path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=patient_rows[0].keys())
-        writer.writeheader()
-        writer.writerows(patient_rows)
-
-    plot_confusion_matrix(
-        severity_confusion,
-        output_dir / "patient_severity_confusion_matrix.png",
-        "Patient maximum primary score",
-        list(range(1, severity_levels + 1)),
-        "score",
-    )
     plot_confusion_matrix(
         segmentation_confusion,
         output_dir / "segmentation_confusion_matrix.png",
@@ -377,11 +301,8 @@ def main():
     )
 
     print(f"Evaluated {evaluated_patients} patients; segmentation evaluated on {segmentation_patients}; skipped {skipped_patients}.")
-    print(f"Patient severity accuracy: {metrics['patient_severity']['accuracy']:.3f}")
-    print(f"Patient severity MAE: {metrics['patient_severity']['mean_absolute_error']:.3f}")
     print(f"Mean foreground segmentation Dice: {metrics['segmentation']['classes']['mean_foreground_dice']}")
     print(f"Saved metrics: {metrics_path}")
-    print(f"Saved patient predictions: {predictions_path}")
     print(f"Loaded split metadata CSVs from: {split_dir}")
     print(f"Saved loss curves: {loss_plot_path}")
     print(f"Saved per-channel segmentations: {segmentations_dir}")
