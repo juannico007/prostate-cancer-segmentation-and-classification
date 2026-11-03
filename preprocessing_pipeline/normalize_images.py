@@ -1,8 +1,9 @@
 import itk
 import nibabel as nib
+import numpy as np
 import os
 from pathlib import Path, PurePath
-from typing import Tuple
+from typing import Literal, Tuple
 from tqdm import tqdm
 
 def check_image_alignment(pet_image_path, mri_image_path):
@@ -10,6 +11,42 @@ def check_image_alignment(pet_image_path, mri_image_path):
     mri = nib.load(mri_image_path)
 
     return nib.aff2axcodes(pet.affine) == nib.aff2axcodes(mri.affine)
+
+def normalize_intensity(image: itk.Image, reference_image: itk.Image, method: Literal["zscore", "minmax", "none"] = "zscore") -> itk.Image:
+    """Return a normalised copy of ``image`` using the requested strategy.
+
+    Parameters
+    ----------
+    image : itk.Image
+        Input image to normalise. Spatial metadata is preserved in the output.
+    reference_image : itk.Image
+        Reference image used for normalization, used for the cropped MRI.
+    method : {"zscore", "minmax", "none"}, default="none"
+        Name of the intensity scaling strategy to apply.
+
+    Returns
+    -------
+    itk.Image
+        The normalised image (or the original image when ``method`` is ``none``).
+    """
+    if method == "none":
+        return image
+
+    arr = itk.GetArrayFromImage(image).astype(np.float32)
+    ref_arr = itk.GetArrayFromImage(reference_image).astype(np.float32)
+
+    if method == "zscore":
+        m, s = float(ref_arr.mean()), float(ref_arr.std())
+        arr = (arr - m) / s if s > 0 else (arr - m)
+    elif method == "minmax":
+        lo, hi = float(ref_arr.min()), float(ref_arr.max())
+        arr = (arr - lo) / (hi - lo) if hi > lo else (arr - lo)
+    else:
+        raise ValueError(f"Unknown normalization: {method}")
+
+    out = itk.GetImageFromArray(arr)
+    out.CopyInformation(image)
+    return out
 
 def resample_to_size(input_image: itk.Image, target_size: Tuple[float, float, float], interpolator = "linear") -> itk.Image:
     """Take the image resample it onto ``volume``.
@@ -114,34 +151,41 @@ def resample_mask_to_reference(
 
     return resample.GetOutput()
 
-def process_patient_nifti(patient_folder, output_folder, target_size = None):
+def process_patient_nifti(patient_folder, patient, output_folder, target_size = None):
 
     folder = Path(patient_folder)
     #This regular expression includes the lesions as well so we need to filter them out afterwards.
-    pet_image_path = next(folder.rglob("*PET.nii.gz"))
+    pet_image_path = os.path.join(patient_folder, f"study_{patient}_PET.nii.gz")
     
-    mri_image_path = next(folder.rglob("*MRI_T2.nii.gz"), None)
+    cropped_mri_image_path = os.path.join(patient_folder, f"study_{patient}_cropped_MRI_T2.nii.gz")
+    mri_image_path = os.path.join(patient_folder, f"study_{patient}_MRI_T2.nii.gz")
     lesion_image_paths = list(folder.rglob("*Lesion*.nii.gz"))
     print(lesion_image_paths)
-    mri_image_name = PurePath(mri_image_path).name
+    mri_image_name = PurePath(cropped_mri_image_path).name
     pet_image_name = PurePath(pet_image_path).name
     
 
     output_mri_path = os.path.join(output_folder, mri_image_name)
     output_pet_path = os.path.join(output_folder, pet_image_name)
 
-    if check_image_alignment(pet_image_path, mri_image_path):
+    if check_image_alignment(pet_image_path, cropped_mri_image_path):
         pet_image = itk.imread(pet_image_path)
+        cropped_mri_image = itk.imread(cropped_mri_image_path)
         mri_image = itk.imread(mri_image_path)
         
 
         if target_size is not None:
-            mri_image = resample_to_size(mri_image, target_size)
+            cropped_mri_image = resample_to_size(cropped_mri_image, target_size)
         
-        pet_resampled = resample_image_to_mri(pet_image, mri_image)
+        pet_resampled = resample_image_to_mri(pet_image, cropped_mri_image)
+
+        normalized_mri_image = normalize_intensity(cropped_mri_image, mri_image, method="zscore")
+        normalized_pet_image = normalize_intensity(pet_resampled, pet_image, method="zscore")
+        
         os.makedirs(output_folder, exist_ok=True)
-        itk.imwrite(mri_image, output_mri_path)
-        itk.imwrite(pet_resampled, output_pet_path)
+        itk.imwrite(normalized_mri_image, output_mri_path)
+        itk.imwrite(normalized_pet_image, output_pet_path)
+
 
         if not lesion_image_paths:
             return
@@ -151,12 +195,12 @@ def process_patient_nifti(patient_folder, output_folder, target_size = None):
             lesion_image_name = PurePath(lesion_image_path).name
             output_lesion_path = os.path.join(output_folder, lesion_image_name)
             lesion_image = itk.imread(lesion_image_path)
-            lesion_resampled = resample_mask_to_reference(lesion_image, mri_image)
+            lesion_resampled = resample_mask_to_reference(lesion_image, normalized_mri_image)
             itk.imwrite(lesion_resampled, output_lesion_path)
     
 for patient in tqdm(os.listdir("Data/converted_nii_images")):
     patient_folder = os.path.join("Data/converted_nii_images", patient)
-    output_folder = os.path.join("Data/resampled_images", patient)
+    output_folder = os.path.join("Data/cropped_resampled_images", patient)
     print("processing patient: ", patient)
-    process_patient_nifti(patient_folder, output_folder, target_size=(128, 128, 128))
+    process_patient_nifti(patient_folder, patient, output_folder, target_size=(128, 128, 128))
     print()

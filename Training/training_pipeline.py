@@ -430,6 +430,7 @@ class TrainingPipeline:
         gradient_accumulation_steps: int = 1,
         num_workers: int = 2,
         class_weight_power: Optional[float] = 2.0,
+        grouped_normalization: bool = True,
         ):
         """
         Initialize training pipeline.
@@ -465,6 +466,9 @@ class TrainingPipeline:
         self.mixed_precision = mixed_precision
         self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
         self.num_workers = max(0, int(num_workers))
+        if not isinstance(grouped_normalization, bool):
+            raise ValueError("grouped_normalization must be a boolean.")
+        self.grouped_normalization = grouped_normalization
         self.scheduler_config = dict(scheduler_config) if scheduler_config else {
             "name": "step",
             "step_size": 100,
@@ -545,8 +549,11 @@ class TrainingPipeline:
             nii_path=nii_path,
             records=train_records,
         )
-        self.normalization_stats = train_dataset.compute_normalization_stats()
-        train_dataset.normalization_stats = self.normalization_stats
+        if self.grouped_normalization:
+            self.normalization_stats = train_dataset.compute_normalization_stats()
+            train_dataset.normalization_stats = self.normalization_stats
+        else:
+            self.normalization_stats = None
         if self.losses.class_weight_power is not None:
             self._configure_class_weights(train_dataset)
         val_dataset = ProstateDataset(

@@ -151,6 +151,9 @@ def main():
 
     with config_path.open(encoding="utf-8") as stream:
         config = json.load(stream)
+    grouped_normalization = config.get("grouped_normalization", True)
+    if not isinstance(grouped_normalization, bool):
+        raise ValueError("grouped_normalization must be a boolean in the config file.")
 
     def resolve_path(path):
         path = Path(path)
@@ -208,8 +211,10 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if "model_state_dict" in checkpoint:
         state = checkpoint["model_state_dict"]
-        normalization_stats = checkpoint.get("normalization_stats")
-        if normalization_stats is None:
+        normalization_stats = (
+            checkpoint.get("normalization_stats") if grouped_normalization else None
+        )
+        if grouped_normalization and normalization_stats is None:
             raise ValueError(
                 f"Checkpoint is missing normalization parameters: {checkpoint_path}"
             )
@@ -230,6 +235,8 @@ def main():
     )
     if normalization_stats is not None:
         print(f"Using training-set normalization parameters: {normalization_stats}")
+    elif not grouped_normalization:
+        print("Grouped training-set normalization is disabled.")
 
     severity_levels = model.num_severity_levels
     severity_confusion = np.zeros((severity_levels, severity_levels), dtype=np.int64)

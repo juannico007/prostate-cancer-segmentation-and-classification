@@ -62,6 +62,9 @@ def main():
         if args.class_weight_power is not None
         else hyperparams.get("class_weight_power", 2.0)
     )
+    grouped_normalization = hyperparams.get("grouped_normalization", True)
+    if not isinstance(grouped_normalization, bool):
+        raise ValueError("grouped_normalization must be a boolean in the config file.")
     if class_weight_power is not None and class_weight_power <= 0:
         raise ValueError("class_weight_power must be greater than zero or null.")
     hyperparams["classification_loss"] = classification_loss
@@ -141,6 +144,7 @@ def main():
         mixed_precision=hyperparams["mixed_precision"],
         gradient_accumulation_steps=hyperparams["gradient_accumulation_steps"],
         num_workers=hyperparams["num_workers"],
+        grouped_normalization=grouped_normalization,
     )
 
     print("\n[4/5] Creating Pytorch dataloaders...")
