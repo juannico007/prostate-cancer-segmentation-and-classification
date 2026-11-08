@@ -171,9 +171,11 @@ class ProstateDataset(Dataset):
         nii_path: Path,
         records: List[Record],
         normalization_stats: Optional[Dict[str, Dict[str, float]]] = None,
+        binary_segmentation: bool = False,
     ):
         self.nii_path = str(nii_path)
         self.records = records
+        self.binary_segmentation = binary_segmentation
         if normalization_stats is not None:
             validated_stats = {}
             for modality in ("mri", "pet"):
@@ -361,6 +363,9 @@ class ProstateDataset(Dataset):
                 ]) if has_bbox else None,
             })
 
+        if self.binary_segmentation:
+            segmentation_target = (segmentation_target > 0).astype(np.int64)
+
         return {
             "patient_id": record.series_id,
             "mri": mri_volume,
@@ -368,7 +373,7 @@ class ProstateDataset(Dataset):
             "targets": targets,
             "segmentation": segmentation_target,
             "segmentation_valid": segmentation_valid,
-            "patient_score": max(lesion.label for lesion in record.lesions),
+            "binary_segmentation": self.binary_segmentation,
         }
 
 def collate_fn(batch):
@@ -383,10 +388,17 @@ def collate_fn(batch):
     ])
 
     x = torch.stack([mri, pet], dim=1)
+    binary_segmentation = batch[0]["binary_segmentation"]
+    if any(item["binary_segmentation"] != binary_segmentation for item in batch):
+        raise ValueError("A batch cannot mix binary and multiclass segmentation targets.")
     segmentation = torch.stack([
-        torch.from_numpy(item["segmentation"]).long()
+        torch.from_numpy(item["segmentation"]).float()
+        if binary_segmentation
+        else torch.from_numpy(item["segmentation"]).long()
         for item in batch
     ])
+    if binary_segmentation:
+        segmentation = segmentation.unsqueeze(1)
 
     return {
         "patient_id": [item["patient_id"] for item in batch],
@@ -396,14 +408,11 @@ def collate_fn(batch):
         "segmentation_valid": torch.tensor(
             [item["segmentation_valid"] for item in batch], dtype=torch.bool
         ),
-        "patient_score": torch.tensor(
-            [item["patient_score"] for item in batch], dtype=torch.long
-        ),
     }
 
 
 class TrainingPipeline:
-    """Training pipeline for the prostate cancer classification model."""
+    """Training pipeline for the prostate cancer segmentation model."""
     
     def __init__(
         self,
@@ -416,7 +425,7 @@ class TrainingPipeline:
         lr_reduction_patience: int = 10,
         lr_reduction_factor : float = 0.5,
         min_lr : float = 1e-7,
-        checkpoint_path: str = "prostate_classification_best.pt",
+        checkpoint_path: str = "prostate_segmentation_best.pt",
         data_csv: Optional[Path] = None,
         train_ratio: float = 0.8,
         validation_ratio: float = 0.1,
@@ -424,13 +433,12 @@ class TrainingPipeline:
         split_seed: int = 42,
         scheduler_config: Optional[Dict[str, Any]] = None,
         loss_weights: Optional[Dict[str, float]] = None,
-        classification_loss: str = "cross_entropy",
-        gaussian_sigma: float = 1.0,
         mixed_precision: bool = True,
         gradient_accumulation_steps: int = 1,
         num_workers: int = 2,
         class_weight_power: Optional[float] = 2.0,
         grouped_normalization: bool = True,
+        binary_segmentation: bool = False,
         ):
         """
         Initialize training pipeline.
@@ -446,7 +454,7 @@ class TrainingPipeline:
             lr_reduction_factor: Learning rate reduction on plateau
             min_lr: Minimum value for the learning rate
             checkpoint_path: Path to save best model
-            loss_weights: dict with weights for segmentation/classification
+            loss_weights: dict with the segmentation loss weight
         """
         self.model = model
         self.batch_size = batch_size
@@ -469,6 +477,11 @@ class TrainingPipeline:
         if not isinstance(grouped_normalization, bool):
             raise ValueError("grouped_normalization must be a boolean.")
         self.grouped_normalization = grouped_normalization
+        if not isinstance(binary_segmentation, bool):
+            raise ValueError("binary_segmentation must be a boolean.")
+        if binary_segmentation and model.out_channels != 1:
+            raise ValueError("Binary segmentation requires a model with out_channels=1.")
+        self.binary_segmentation = binary_segmentation
         self.scheduler_config = dict(scheduler_config) if scheduler_config else {
             "name": "step",
             "step_size": 100,
@@ -476,11 +489,9 @@ class TrainingPipeline:
         }
         self.losses = TrainingLosses(
             segmentation_classes=model.out_channels,
-            severity_levels=model.num_severity_levels,
             loss_weights=loss_weights,
-            classification_loss=classification_loss,
-            gaussian_sigma=gaussian_sigma,
             class_weight_power=class_weight_power,
+            binary_segmentation=binary_segmentation,
         )
         self.normalization_stats: Optional[Dict[str, Dict[str, float]]] = None
 
@@ -515,7 +526,11 @@ class TrainingPipeline:
         if not records:
             raise ValueError(f"No patch records found in {data_csv}")
 
-        volume_check = ProstateDataset(nii_path=nii_path, records=records)
+        volume_check = ProstateDataset(
+            nii_path=nii_path,
+            records=records,
+            binary_segmentation=self.binary_segmentation,
+        )
 
         if splits is None:
             splits = split_records(
@@ -548,18 +563,23 @@ class TrainingPipeline:
         train_dataset = ProstateDataset(
             nii_path=nii_path,
             records=train_records,
+            binary_segmentation=self.binary_segmentation,
         )
         if self.grouped_normalization:
             self.normalization_stats = train_dataset.compute_normalization_stats()
             train_dataset.normalization_stats = self.normalization_stats
         else:
             self.normalization_stats = None
-        if self.losses.class_weight_power is not None:
+        if (
+            not self.binary_segmentation
+            and self.losses.class_weight_power is not None
+        ):
             self._configure_class_weights(train_dataset)
         val_dataset = ProstateDataset(
             nii_path=nii_path,
             records=val_records,
             normalization_stats=self.normalization_stats,
+            binary_segmentation=self.binary_segmentation,
         )
 
         train_loader = DataLoader(
@@ -586,16 +606,6 @@ class TrainingPipeline:
         return self.train_loader, self.val_loader
 
     def _configure_class_weights(self, train_dataset):
-        severity_counts = np.zeros(self.model.num_severity_levels, dtype=np.int64)
-        for record in train_dataset.records:
-            score = max(lesion.label for lesion in record.lesions)
-            if score < 1 or score > self.model.num_severity_levels:
-                raise ValueError(
-                    f"Patient {record.series_id} has score {score}, outside the model's "
-                    f"1-{self.model.num_severity_levels} severity levels."
-                )
-            severity_counts[score - 1] += 1
-
         segmentation_counts = np.zeros(self.model.out_channels, dtype=np.int64)
         valid_segmentation_patients = 0
         for index in tqdm(range(len(train_dataset)), desc="class-weight scan", leave=False):
@@ -611,13 +621,7 @@ class TrainingPipeline:
             segmentation_counts += counts
             valid_segmentation_patients += 1
 
-        self.losses.configure_class_weights(segmentation_counts, severity_counts)
-        print(
-            "[Info] Inverse-frequency severity weights:",
-            self.losses.severity_class_weights.tolist(),
-            "from counts:",
-            severity_counts.tolist(),
-        )
+        self.losses.configure_class_weights(segmentation_counts)
         print(
             "[Info] Inverse-frequency segmentation weights:",
             self.losses.segmentation_class_weights.tolist(),
@@ -694,7 +698,7 @@ class TrainingPipeline:
         return self.losses(outputs, batch)
 
     def train(self) -> dict:
-        """Train full-volume segmentation and patient-level ordinal severity heads."""
+        """Train the full-volume segmentation model."""
         if not hasattr(self, "train_loader") or not hasattr(self, "val_loader"):
             raise ValueError("Create dataloaders before calling train().")
 
@@ -710,7 +714,7 @@ class TrainingPipeline:
         )
         self._configure_scheduler()
 
-        metric_names = ("total", "segmentation", "severity", "dice", "severity_mae", "severity_accuracy")
+        metric_names = ("total", "segmentation", "dice")
         history = {f"{split}_{name}": [] for split in ("train", "val") for name in metric_names}
         best_val_loss = float("inf")
         epochs_no_improve = 0
@@ -723,6 +727,8 @@ class TrainingPipeline:
             loader_length = len(loader)
             split_name = "train" if training else "validation"
             for batch_index, batch in enumerate(tqdm(loader, leave=False, desc=split_name)):
+                if not batch["segmentation_valid"].any():
+                    continue
                 images = batch["image"].to(self.device, non_blocking=True)
                 with torch.set_grad_enabled(training):
                     with torch.autocast(
@@ -752,6 +758,8 @@ class TrainingPipeline:
                             self.optimizer.zero_grad(set_to_none=True)
                 for name in metric_names:
                     totals[name].append(float(losses[name].detach().cpu()))
+            if not totals["total"]:
+                raise ValueError(f"No valid segmentation targets found in {split_name} data.")
             return {
                 name: float(np.mean(values)) if values else 0.0
                 for name, values in totals.items()
@@ -769,14 +777,9 @@ class TrainingPipeline:
             print(
                 f"Epoch {epoch}/{self.epochs} | "
                 f"train loss {train_metrics['total']:.4f} "
-                f"(seg {train_metrics['segmentation']:.4f}, "
-                f"severity {train_metrics['severity']:.4f}, Dice {train_metrics['dice']:.4f}, "
-                f"score acc {train_metrics['severity_accuracy']:.3f}) | "
+                f"(seg {train_metrics['segmentation']:.4f}, Dice {train_metrics['dice']:.4f}) | "
                 f"val loss {val_metrics['total']:.4f} "
-                f"(seg {val_metrics['segmentation']:.4f}, "
-                f"severity {val_metrics['severity']:.4f}, Dice {val_metrics['dice']:.4f}, "
-                f"score MAE {val_metrics['severity_mae']:.3f}, "
-                f"score acc {val_metrics['severity_accuracy']:.3f})"
+                f"(seg {val_metrics['segmentation']:.4f}, Dice {val_metrics['dice']:.4f})"
             )
 
             val_loss = val_metrics["total"]

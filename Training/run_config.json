@@ -1,5 +1,5 @@
 {
-  "experiment_dir": "results/cropped_prostate/weighting_no_augmentation/coral_loss_with_segmentation",
+  "experiment_dir": "results/cropped_prostate/weighting_no_augmentation/binary_segment",
   "data_dir": "Data/cropped_resampled_images",
   "data_csv": "Data/data.csv",
   "input_shape": [
@@ -24,27 +24,22 @@
   "split_seed": 42,
   "lr_reduction_epochs": 10,
   "loss_weights": {
-    "classification": 1,
-    "segmentation": 0.5
+    "segmentation": 1
   },
-  "classification_loss": "coral",
   "grouped_normalization": false,
-  "gaussian_sigma": 1.0,
+  "binary_segmentation": true,
   "class_weight_power": 0.5,
-  "model_name": "coral_loss_with_segmentation",
+  "model_name": "binary_segment",
   "model_version": "0.4",
-  "split": "val",
-  "num_examples": 4,
+  "split": "train",
+  "num_examples": 20,
   "unet": {
     "activation": "relu",
     "attention": true,
     "conv_mode": "same",
-    "dropout": 0.2,
     "in_channels": 2,
     "n_blocks": 4,
     "normalization": "group4",
-    "num_severity_levels": 5,
-    "ordinal_classification": false,
     "out_channels": 4,
     "start_filters": 16,
     "up_mode": "trilinear"

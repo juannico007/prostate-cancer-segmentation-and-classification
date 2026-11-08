@@ -342,71 +342,6 @@ class UpBlock(nn.Module):
             y = self.norm3(y)
         return y
 
-class ClassifierBlock(nn.Module):
-    """
-    Classifier block with fully layers outputing n binary classes.
-
-    Parameters:
-        in_channels: Number of input channels
-        middle_neurons: Number of neurons in the middle layer
-        out_neurons: Number of output neurons
-        drop: Dropout rate in the middle layer
-        activation: Activation function name
-    Returns:
-        classification output.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_neurons: int,
-        middle_neurons: int,
-        drop: float,
-        activation: str = 'relu',
-        ordinal: bool = False,
-    ):
-        super().__init__()
-
-        self.in_channels = in_channels
-        self.middle_neurons = middle_neurons
-        self.out_neurons = out_neurons
-        self.drop = drop
-        self.activation = activation
-        self.ordinal = ordinal
-    
-        self.gap = nn.AdaptiveAvgPool3d(1)
-        self.fc1 = nn.Linear(self.in_channels, self.middle_neurons)
-        self.act1 = get_activation(self.activation)
-        self.dropout = nn.Dropout(self.drop)
-        self.fc2 = nn.Linear(
-            self.middle_neurons,
-            1 if self.ordinal else self.out_neurons,
-            bias=not self.ordinal,
-        )
-        if self.ordinal:
-            self.ordinal_bias = nn.Parameter(torch.zeros(self.out_neurons))
-        
-    def initialize_classifier(self):
-        nn.init.kaiming_uniform_(self.fc1.weight, a=0, mode='fan_in', nonlinearity='relu')
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.kaiming_uniform_(self.fc2.weight, a=0, mode='fan_in', nonlinearity='relu')
-        if self.fc2.bias is not None:
-            nn.init.zeros_(self.fc2.bias)
-        if self.ordinal:
-            nn.init.zeros_(self.ordinal_bias)
-
-    def forward(self, encoded_features):
-        y = self.gap(encoded_features)
-        y = y.view(y.size(0), -1)
-
-        y = self.fc1(y)
-        y = self.act1(y)
-        y = self.dropout(y)
-        y = self.fc2(y)
-        if self.ordinal:
-            y = y + self.ordinal_bias
-        return y
-
 class UNet(nn.Module):
     """
     3D U-Net implementation.
@@ -420,9 +355,6 @@ class UNet(nn.Module):
         normalization: Normalization type. Defaults to 'batch'
         conv_mode: 'same' or 'valid'. Defaults to 'same'
         up_mode: 'transposed' or interpolation mode. Defaults to 'transposed'.
-        middle_neurons: number of middle neurons for classifier block
-        class_output: number of output neurons in the classifier
-        dropout: dropout rate in the classifier
     Returns:
         Final output feature map.
     """
@@ -436,11 +368,7 @@ class UNet(nn.Module):
         normalization: str = 'batch',
         conv_mode: str = 'same',
         up_mode: str = 'transposed',
-        middle_neurons: int = 256,
-        dropout: float = 0,
         attention: bool = False,
-        num_severity_levels: int = 5,
-        ordinal_classification: bool = False,
     ):
         super().__init__()
 
@@ -452,13 +380,7 @@ class UNet(nn.Module):
         self.normalization = normalization
         self.conv_mode = conv_mode
         self.up_mode = up_mode
-        self.middle_neurons = middle_neurons
-        self.dropout = dropout
         self.attention = attention
-        self.num_severity_levels = num_severity_levels
-        self.ordinal_classification = ordinal_classification
-        if self.num_severity_levels < 2:
-            raise ValueError("num_severity_levels must be at least 2.")
 
         self.down_blocks = []
         self.up_blocks = []
@@ -498,18 +420,7 @@ class UNet(nn.Module):
 
             self.up_blocks.append(up_block)
 
-        bottleneck_channels = self.start_filters * (2 ** (self.n_blocks - 1))
         self.segmentation_head = get_conv_layer(num_filters_out, self.out_channels, kernel_size=1, padding=0)
-        self.severity_head = ClassifierBlock(in_channels=bottleneck_channels,
-                                             middle_neurons=self.middle_neurons,
-                                             out_neurons=(
-                                                 self.num_severity_levels - 1
-                                                 if self.ordinal_classification
-                                                 else self.num_severity_levels
-                                             ),
-                                             drop=self.dropout,
-                                             ordinal=self.ordinal_classification)
-        self.severity_head.initialize_classifier()
         
         self.down_blocks = nn.ModuleList(self.down_blocks)
         self.up_blocks = nn.ModuleList(self.up_blocks)
@@ -547,15 +458,10 @@ class UNet(nn.Module):
             x, before_pooling = module(x)
             encoder_output.append(before_pooling)
 
-        severity_logits = self.severity_head(x)
-
         for i, module in enumerate(self.up_blocks):
             before_pool = encoder_output[-(i + 2)]
             x = module(before_pool, x)
         
         segmentation_logits = self.segmentation_head(x)
 
-        return {
-            "segmentation_logits": segmentation_logits,
-            "severity_logits": severity_logits,
-        }
+        return {"segmentation_logits": segmentation_logits}

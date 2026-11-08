@@ -41,7 +41,7 @@ def segment_prostate(patient_id, scan_folder, patient_output_folder):
     return segmentation.astype(np.uint8)
 
 
-def crop_prostate(image, mask, resolution = 256):
+def crop_prostate(image, mask, resolution = 350):
     """
     Crops the prostate region from the given image using the provided mask.
 
