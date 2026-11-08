@@ -1,5 +1,5 @@
 {
-  "experiment_dir": "results/cropped_prostate/weighting_augmented/binary_segment",
+  "experiment_dir": "results/cropped_prostate/weighting_augmented/binary_segment_class_3_5",
   "data_dir": "Data/cropped_resampled_images",
   "data_csv": "Data/data.csv",
   "input_shape": [
@@ -30,9 +30,9 @@
   "data_augmentation": true,
   "binary_segmentation": true,
   "class_weight_power": 0.5,
-  "model_name": "binary_segment",
+  "model_name": "binary_segment_class_3_5",
   "model_version": "0.4",
-  "split": "val",
+  "split": "train",
   "num_examples": 20,
   "unet": {
     "activation": "relu",

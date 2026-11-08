@@ -78,6 +78,25 @@ def main():
     records = load_records(data_csv)
     if not records:
         raise ValueError(f"No records found in {data_csv}")
+    if binary_segmentation:
+        eligible_primary_scores = {3, 4, 5}
+        filtered_records = [
+            record
+            for record in records
+            if any(lesion.label in eligible_primary_scores for lesion in record.lesions)
+        ]
+        excluded_count = len(records) - len(filtered_records)
+        if excluded_count:
+            print(
+                "[Info] Binary segmentation enabled: excluding "
+                f"{excluded_count} patient(s) without PRIMARY score 3-5 lesions."
+            )
+        records = filtered_records
+        if not records:
+            raise ValueError(
+                "Binary segmentation requires patients with PRIMARY scores 3, 4, or 5. "
+                f"None were found in {data_csv}."
+            )
 
     splits = split_records(
         records,
