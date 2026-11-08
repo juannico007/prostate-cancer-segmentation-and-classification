@@ -125,6 +125,7 @@ def main():
         num_workers=hyperparams["num_workers"],
         grouped_normalization=grouped_normalization,
         binary_segmentation=binary_segmentation,
+        data_augmentation=hyperparams.get("data_augmentation", True),
     )
 
     print("\n[4/5] Creating Pytorch dataloaders...")

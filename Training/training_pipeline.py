@@ -439,6 +439,7 @@ class TrainingPipeline:
         class_weight_power: Optional[float] = 2.0,
         grouped_normalization: bool = True,
         binary_segmentation: bool = False,
+        data_augmentation: bool = True,
         ):
         """
         Initialize training pipeline.
@@ -455,6 +456,7 @@ class TrainingPipeline:
             min_lr: Minimum value for the learning rate
             checkpoint_path: Path to save best model
             loss_weights: dict with the segmentation loss weight
+            data_augmentation: Apply random right-angle rotations and axis reflections during training
         """
         self.model = model
         self.batch_size = batch_size
@@ -482,6 +484,9 @@ class TrainingPipeline:
         if binary_segmentation and model.out_channels != 1:
             raise ValueError("Binary segmentation requires a model with out_channels=1.")
         self.binary_segmentation = binary_segmentation
+        if not isinstance(data_augmentation, bool):
+            raise ValueError("data_augmentation must be a boolean.")
+        self.data_augmentation = data_augmentation
         self.scheduler_config = dict(scheduler_config) if scheduler_config else {
             "name": "step",
             "step_size": 100,
@@ -555,8 +560,6 @@ class TrainingPipeline:
             raise ValueError("No training studies have both PET and MRI_T2 volumes.")
         if not val_records:
             raise ValueError("No validation studies have both PET and MRI_T2 volumes.")
-        #For now we won't add data augmentation, but it will come as a TODO
-
         print("training records:", [i.series_id for i in train_records])
         print("validation records:", [i.series_id for i in val_records])
 
@@ -697,6 +700,28 @@ class TrainingPipeline:
     def _compute_losses(self, outputs, batch):
         return self.losses(outputs, batch)
 
+    @staticmethod
+    def _augment_training_data(images, segmentation):
+        """Apply matching, shape-preserving spatial transforms independently per sample."""
+        augmented_images = []
+        augmented_targets = []
+        for image, target in zip(images, segmentation):
+            for axes in ((-3, -2), (-3, -1), (-2, -1)):
+                quarter_turns = int(torch.randint(4, ()).item())
+                if image.shape[axes[0]] != image.shape[axes[1]]:
+                    quarter_turns = (quarter_turns % 2) * 2
+                image = torch.rot90(image, quarter_turns, dims=axes)
+                target = torch.rot90(target, quarter_turns, dims=axes)
+            flip_axes = tuple(
+                axis for axis in (-3, -2, -1) if torch.rand(()).item() < 0.5
+            )
+            if flip_axes:
+                image = torch.flip(image, dims=flip_axes)
+                target = torch.flip(target, dims=flip_axes)
+            augmented_images.append(image)
+            augmented_targets.append(target)
+        return torch.stack(augmented_images), torch.stack(augmented_targets)
+
     def train(self) -> dict:
         """Train the full-volume segmentation model."""
         if not hasattr(self, "train_loader") or not hasattr(self, "val_loader"):
@@ -730,6 +755,10 @@ class TrainingPipeline:
                 if not batch["segmentation_valid"].any():
                     continue
                 images = batch["image"].to(self.device, non_blocking=True)
+                if training and self.data_augmentation:
+                    segmentation = batch["segmentation"].to(self.device, non_blocking=True)
+                    images, segmentation = self._augment_training_data(images, segmentation)
+                    batch = {**batch, "segmentation": segmentation}
                 with torch.set_grad_enabled(training):
                     with torch.autocast(
                         device_type=self.device.type,
