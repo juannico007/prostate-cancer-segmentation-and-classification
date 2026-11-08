@@ -171,9 +171,11 @@ class ProstateDataset(Dataset):
         nii_path: Path,
         records: List[Record],
         normalization_stats: Optional[Dict[str, Dict[str, float]]] = None,
+        binary_segmentation: bool = False,
     ):
         self.nii_path = str(nii_path)
         self.records = records
+        self.binary_segmentation = binary_segmentation
         if normalization_stats is not None:
             validated_stats = {}
             for modality in ("mri", "pet"):
@@ -361,6 +363,9 @@ class ProstateDataset(Dataset):
                 ]) if has_bbox else None,
             })
 
+        if self.binary_segmentation:
+            segmentation_target = (segmentation_target > 0).astype(np.int64)
+
         return {
             "patient_id": record.series_id,
             "mri": mri_volume,
@@ -368,6 +373,7 @@ class ProstateDataset(Dataset):
             "targets": targets,
             "segmentation": segmentation_target,
             "segmentation_valid": segmentation_valid,
+            "binary_segmentation": self.binary_segmentation,
         }
 
 def collate_fn(batch):
@@ -382,10 +388,17 @@ def collate_fn(batch):
     ])
 
     x = torch.stack([mri, pet], dim=1)
+    binary_segmentation = batch[0]["binary_segmentation"]
+    if any(item["binary_segmentation"] != binary_segmentation for item in batch):
+        raise ValueError("A batch cannot mix binary and multiclass segmentation targets.")
     segmentation = torch.stack([
-        torch.from_numpy(item["segmentation"]).long()
+        torch.from_numpy(item["segmentation"]).float()
+        if binary_segmentation
+        else torch.from_numpy(item["segmentation"]).long()
         for item in batch
     ])
+    if binary_segmentation:
+        segmentation = segmentation.unsqueeze(1)
 
     return {
         "patient_id": [item["patient_id"] for item in batch],
@@ -425,6 +438,7 @@ class TrainingPipeline:
         num_workers: int = 2,
         class_weight_power: Optional[float] = 2.0,
         grouped_normalization: bool = True,
+        binary_segmentation: bool = False,
         ):
         """
         Initialize training pipeline.
@@ -463,6 +477,11 @@ class TrainingPipeline:
         if not isinstance(grouped_normalization, bool):
             raise ValueError("grouped_normalization must be a boolean.")
         self.grouped_normalization = grouped_normalization
+        if not isinstance(binary_segmentation, bool):
+            raise ValueError("binary_segmentation must be a boolean.")
+        if binary_segmentation and model.out_channels != 1:
+            raise ValueError("Binary segmentation requires a model with out_channels=1.")
+        self.binary_segmentation = binary_segmentation
         self.scheduler_config = dict(scheduler_config) if scheduler_config else {
             "name": "step",
             "step_size": 100,
@@ -472,6 +491,7 @@ class TrainingPipeline:
             segmentation_classes=model.out_channels,
             loss_weights=loss_weights,
             class_weight_power=class_weight_power,
+            binary_segmentation=binary_segmentation,
         )
         self.normalization_stats: Optional[Dict[str, Dict[str, float]]] = None
 
@@ -506,7 +526,11 @@ class TrainingPipeline:
         if not records:
             raise ValueError(f"No patch records found in {data_csv}")
 
-        volume_check = ProstateDataset(nii_path=nii_path, records=records)
+        volume_check = ProstateDataset(
+            nii_path=nii_path,
+            records=records,
+            binary_segmentation=self.binary_segmentation,
+        )
 
         if splits is None:
             splits = split_records(
@@ -539,18 +563,23 @@ class TrainingPipeline:
         train_dataset = ProstateDataset(
             nii_path=nii_path,
             records=train_records,
+            binary_segmentation=self.binary_segmentation,
         )
         if self.grouped_normalization:
             self.normalization_stats = train_dataset.compute_normalization_stats()
             train_dataset.normalization_stats = self.normalization_stats
         else:
             self.normalization_stats = None
-        if self.losses.class_weight_power is not None:
+        if (
+            not self.binary_segmentation
+            and self.losses.class_weight_power is not None
+        ):
             self._configure_class_weights(train_dataset)
         val_dataset = ProstateDataset(
             nii_path=nii_path,
             records=val_records,
             normalization_stats=self.normalization_stats,
+            binary_segmentation=self.binary_segmentation,
         )
 
         train_loader = DataLoader(

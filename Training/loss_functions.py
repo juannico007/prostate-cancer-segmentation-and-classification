@@ -23,16 +23,22 @@ class TrainingLosses(nn.Module):
         segmentation_classes,
         loss_weights=None,
         class_weight_power=2.0,
+        binary_segmentation=False,
     ):
         super().__init__()
         if class_weight_power is not None and class_weight_power <= 0:
             raise ValueError("class_weight_power must be greater than zero or None.")
+        if binary_segmentation and segmentation_classes != 1:
+            raise ValueError("Binary segmentation requires exactly one output channel.")
 
         loss_weights = loss_weights or {}
         self.segmentation_classes = segmentation_classes
+        self.binary_segmentation = binary_segmentation
         self.segmentation_weight = float(loss_weights.get("segmentation", 1.0))
         self.class_weight_power = (
-            float(class_weight_power) if class_weight_power is not None else None
+            float(class_weight_power)
+            if class_weight_power is not None and not binary_segmentation
+            else None
         )
         self.register_buffer("segmentation_class_weights", None)
 
@@ -53,6 +59,18 @@ class TrainingLosses(nn.Module):
 
         valid_logits = logits[valid]
         valid_targets = targets[valid]
+        if self.binary_segmentation:
+            binary_targets = valid_targets.to(dtype=valid_logits.dtype)
+            binary_cross_entropy = F.binary_cross_entropy_with_logits(
+                valid_logits,
+                binary_targets,
+            )
+            probabilities = torch.sigmoid(valid_logits)
+            intersection = (probabilities * binary_targets).sum()
+            denominator = probabilities.sum() + binary_targets.sum()
+            dice = (2 * intersection + 1e-5) / (denominator + 1e-5)
+            return binary_cross_entropy + (1 - dice), dice
+
         cross_entropy = F.cross_entropy(
             valid_logits,
             valid_targets,

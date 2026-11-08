@@ -44,6 +44,9 @@ def main():
     grouped_normalization = hyperparams.get("grouped_normalization", True)
     if not isinstance(grouped_normalization, bool):
         raise ValueError("grouped_normalization must be a boolean in the config file.")
+    binary_segmentation = hyperparams.get("binary_segmentation", False)
+    if not isinstance(binary_segmentation, bool):
+        raise ValueError("binary_segmentation must be a boolean in the config file.")
     if class_weight_power is not None and class_weight_power <= 0:
         raise ValueError("class_weight_power must be greater than zero or null.")
     hyperparams["class_weight_power"] = class_weight_power
@@ -95,6 +98,9 @@ def main():
     print("\n[2/5] Building model...")
 
     unet_kwargs = dict(hyperparams.get("unet", {}))
+    if binary_segmentation:
+        unet_kwargs["out_channels"] = 1
+    hyperparams["unet"] = unet_kwargs
     model = UNet(**unet_kwargs).to(device)
 
     print("\n[3/5] Setting up training pipeline...")
@@ -118,6 +124,7 @@ def main():
         gradient_accumulation_steps=hyperparams["gradient_accumulation_steps"],
         num_workers=hyperparams["num_workers"],
         grouped_normalization=grouped_normalization,
+        binary_segmentation=binary_segmentation,
     )
 
     print("\n[4/5] Creating Pytorch dataloaders...")
