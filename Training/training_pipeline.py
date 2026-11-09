@@ -126,6 +126,82 @@ def split_records(
     }
 
 
+def kfold_split_records(
+    records: List[Record],
+    k_folds: int,
+    split_seed: int,
+    test_records: Optional[List[Record]] = None,
+) -> List[Dict[str, List[Record]]]:
+    """Split the non-test studies into k folds, stratified by each study's highest lesion label.
+
+    Each returned fold uses one partition for validation and the remaining k-1 for training;
+    the held-out test records are shared by every fold.
+    """
+    if not isinstance(k_folds, int) or k_folds < 2:
+        raise ValueError("k_folds must be an integer greater than or equal to 2.")
+    test_records = list(test_records or [])
+    test_ids = {record.series_id for record in test_records}
+    pool = [record for record in records if record.series_id not in test_ids]
+    pool_ids = sorted({record.series_id for record in pool})
+    if len(pool_ids) < k_folds:
+        raise ValueError(
+            f"Cannot create {k_folds} folds from {len(pool_ids)} non-test studies."
+        )
+
+    strata = defaultdict(list)
+    for record in pool:
+        strata[max((lesion.label for lesion in record.lesions), default=0)].append(record.series_id)
+
+    rng = np.random.default_rng(split_seed)
+    fold_ids: List[set] = [set() for _ in range(k_folds)]
+    offset = 0
+    for stratum in sorted(strata):
+        ids = sorted(set(strata[stratum]))
+        rng.shuffle(ids)
+        for position, series_id in enumerate(ids):
+            fold_ids[(offset + position) % k_folds].add(series_id)
+        offset = (offset + len(ids)) % k_folds
+
+    folds = []
+    for validation_ids in fold_ids:
+        folds.append({
+            "train": [record for record in pool if record.series_id not in validation_ids],
+            "validation": [record for record in pool if record.series_id in validation_ids],
+            "test": test_records,
+        })
+    return folds
+
+
+def summarize_fold_histories(fold_histories: Dict[int, Dict[str, List[float]]]) -> Dict[str, Any]:
+    """Summarize per-fold training curves at the checkpointed (lowest validation loss) epoch."""
+    per_fold = {}
+    for fold, history in sorted(fold_histories.items()):
+        val_total = history.get("val_total") or []
+        if not val_total:
+            continue
+        # Training checkpoints on strict improvement, so the first minimum is the saved epoch.
+        best_index = int(np.argmin(val_total))
+        per_fold[str(fold)] = {
+            "epochs_trained": len(val_total),
+            "best_epoch": best_index + 1,
+            "train_dice_at_best_epoch": float(history["train_dice"][best_index]),
+            "val_dice_at_best_epoch": float(history["val_dice"][best_index]),
+            "val_loss_at_best_epoch": float(val_total[best_index]),
+            "max_val_dice": float(np.max(history["val_dice"])),
+            "final_train_dice": float(history["train_dice"][-1]),
+            "final_val_dice": float(history["val_dice"][-1]),
+        }
+
+    aggregate = {}
+    if per_fold:
+        for key in next(iter(per_fold.values())):
+            if key in {"best_epoch", "epochs_trained"}:
+                continue
+            values = np.array([fold_summary[key] for fold_summary in per_fold.values()])
+            aggregate[key] = {"mean": float(values.mean()), "std": float(values.std(ddof=0))}
+    return {"completed_folds": len(per_fold), "folds": per_fold, "aggregate": aggregate}
+
+
 def write_split_csvs(data_csv: Path, splits: Dict[str, List[Record]], output_dir: Path):
     split_ids = {
         split_name: {record.series_id for record in split_records}
