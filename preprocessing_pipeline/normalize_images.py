@@ -48,14 +48,14 @@ def normalize_intensity(image: itk.Image, reference_image: itk.Image, method: Li
     out.CopyInformation(image)
     return out
 
-def resample_to_size(input_image: itk.Image, target_size: Tuple[float, float, float], interpolator = "linear") -> itk.Image:
+def resample_to_size(input_image: itk.Image, target_size: Tuple[int, int, int], interpolator = "linear") -> itk.Image:
     """Take the image resample it onto ``volume``.
 
     Parameters
     ----------
     input_image : itk.Image
         Image to resample.
-    target_size : tuple[float, float, float]
+    target_size : tuple[int, int, int]
         Desired output size (x,y,z)
     interpolator:
         Linear or spline interpolation (will use linear by default as it is more stable)
@@ -68,14 +68,22 @@ def resample_to_size(input_image: itk.Image, target_size: Tuple[float, float, fl
     input_spacing = input_image.GetSpacing()      # e.g. (sx, sy, sz) 
     orig_org = input_image.GetOrigin()
     orig_dir = input_image.GetDirection()
+    if len(target_size) != 3 or any(
+        not isinstance(value, (int, np.integer)) or value <= 0
+        for value in target_size
+    ):
+        raise ValueError("Target size must contain three positive integers.")
     new_size = target_size
 
-    itk.OutputWindow.SetGlobalWarningDisplay(False)
     resample = itk.ResampleImageFilter.New(Input=input_image)
     if interpolator == "linear":
         resample.SetInterpolator(itk.LinearInterpolateImageFunction.New(InputImage=input_image))
     elif interpolator == "spline":
-        resample.SetInterpolator(itk.BSplineInterpolateImageFunction.New(InputImage=input_image, order=3))
+        spline = itk.BSplineInterpolateImageFunction.New(InputImage=input_image)
+        spline.SetSplineOrder(3)
+        resample.SetInterpolator(spline)
+    else:
+        raise ValueError(f"Unknown interpolator: {interpolator}")
     
     output_spacing = [
     input_spacing[i] * input_size[i] / new_size[i]
@@ -157,7 +165,7 @@ def process_patient_nifti(patient_folder, patient, output_folder, target_size = 
     #This regular expression includes the lesions as well so we need to filter them out afterwards.
     pet_image_path = os.path.join(patient_folder, f"study_{patient}_PET.nii.gz")
     
-    cropped_mri_image_path = os.path.join(patient_folder, f"study_{patient}_cropped_MRI_T2.nii.gz")
+    cropped_mri_image_path = os.path.join(patient_folder, f"study_{patient}_new_cropped_MRI_T2.nii.gz")
     mri_image_path = os.path.join(patient_folder, f"study_{patient}_MRI_T2.nii.gz")
     lesion_image_paths = list(folder.rglob("*Lesion*.nii.gz"))
     print(lesion_image_paths)
@@ -198,9 +206,14 @@ def process_patient_nifti(patient_folder, patient, output_folder, target_size = 
             lesion_resampled = resample_mask_to_reference(lesion_image, normalized_mri_image)
             itk.imwrite(lesion_resampled, output_lesion_path)
     
-for patient in tqdm(os.listdir("Data/converted_nii_images")):
-    patient_folder = os.path.join("Data/converted_nii_images", patient)
-    output_folder = os.path.join("Data/cropped_resampled_images", patient)
-    print("processing patient: ", patient)
-    process_patient_nifti(patient_folder, patient, output_folder, target_size=(128, 128, 128))
-    print()
+def main():
+    for patient in tqdm(os.listdir("Data/converted_nii_images")):
+        patient_folder = os.path.join("Data/converted_nii_images", patient)
+        output_folder = os.path.join("Data/cropped_resampled_images_new", patient)
+        print("processing patient: ", patient)
+        process_patient_nifti(patient_folder, patient, output_folder, target_size=(128, 128, 128))
+        print()
+
+
+if __name__ == "__main__":
+    main()
