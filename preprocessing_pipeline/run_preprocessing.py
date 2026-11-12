@@ -68,6 +68,8 @@ def preprocess_patient(
     spacing-resampled MRI. Temporary segmentation files are removed even on
     failure. Normalization uses full spacing-resampled volumes as references,
     matching the existing helper's full-volume rather than cropped statistics.
+    PET without an SUV sidecar uses raw intensities with a warning; configured
+    intensity normalization still applies. Invalid existing sidecars raise errors.
     """
     folder = Path(patient_folder).resolve()
     output = Path(output_folder).resolve()
@@ -105,6 +107,11 @@ def preprocess_patient(
 
     mri_source = sitk.ReadImage(str(mri_path))
     pet_source = sitk.ReadImage(str(pet_path))
+    pet_suv = normalize_images.convert_pet_to_suv(_to_itk(pet_source), pet_path)
+    suv_source = sitk.GetImageFromArray(itk.GetArrayFromImage(pet_suv))
+    suv_source.CopyInformation(pet_source)
+    pet_source = suv_source
+    del pet_suv, suv_source
     print(f"Original {patient} MRI spacing (x, y, z) mm: {mri_source.GetSpacing()}")
     print(f"Original {patient} PET spacing (x, y, z) mm: {pet_source.GetSpacing()}")
     grid = resample_images.resample_to_spacing(

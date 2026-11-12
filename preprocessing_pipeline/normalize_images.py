@@ -2,9 +2,36 @@ import itk
 import nibabel as nib
 import numpy as np
 import os
+import warnings
 from pathlib import Path, PurePath
 from typing import Literal, Tuple
 from tqdm import tqdm
+
+if __package__:
+    from .pet_suv import load_suv_factor, suv_metadata_path
+else:
+    from pet_suv import load_suv_factor, suv_metadata_path
+
+
+def convert_pet_to_suv(image: itk.Image, pet_path: str | Path) -> itk.Image:
+    """Convert PET to SUVbw, or warn and retain raw values if metadata is absent."""
+    metadata_path = suv_metadata_path(pet_path)
+    if not metadata_path.exists():
+        warnings.warn(
+            f"Missing PET SUV metadata: {metadata_path}. Using raw PET intensities "
+            "without SUV conversion; configured intensity normalization still applies.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return image
+    factor = load_suv_factor(pet_path)
+    arr = itk.GetArrayFromImage(image).astype(np.float32) * factor
+    if not np.isfinite(arr).all():
+        raise ValueError(f"PET SUV conversion produced non-finite values: {pet_path}")
+    out = itk.GetImageFromArray(arr)
+    out.CopyInformation(image)
+    return out
+
 
 def check_image_alignment(pet_image_path, mri_image_path):
     pet = nib.load(pet_image_path)
@@ -177,7 +204,7 @@ def process_patient_nifti(patient_folder, patient, output_folder, target_size = 
     output_pet_path = os.path.join(output_folder, pet_image_name)
 
     if check_image_alignment(pet_image_path, cropped_mri_image_path):
-        pet_image = itk.imread(pet_image_path)
+        pet_image = convert_pet_to_suv(itk.imread(pet_image_path), pet_image_path)
         cropped_mri_image = itk.imread(cropped_mri_image_path)
         mri_image = itk.imread(mri_image_path)
         
