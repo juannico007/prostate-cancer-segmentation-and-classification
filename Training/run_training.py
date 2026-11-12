@@ -36,6 +36,24 @@ def fold_dir_name(fold):
     return f"fold_{fold}"
 
 
+def select_training_records(records, binary_segmentation, exclude_low_score_only_patients):
+    """Select the patient cohort before creating any training or evaluation splits."""
+    if not binary_segmentation and not exclude_low_score_only_patients:
+        return records
+    filtered_records = [
+        record for record in records
+        if any(lesion.label in {3, 4, 5} for lesion in record.lesions)
+    ]
+    mode = "Binary" if binary_segmentation else "Multiclass"
+    print(
+        f"[Info] {mode} segmentation: excluding {len(records) - len(filtered_records)} "
+        "patient(s) without PRIMARY score 3-5 lesions."
+    )
+    if not filtered_records:
+        raise ValueError(f"{mode} segmentation requires patients with PRIMARY scores 3, 4, or 5.")
+    return filtered_records
+
+
 def train_run(
     hyperparams,
     run_dir,
@@ -209,6 +227,10 @@ def main():
     binary_segmentation = hyperparams.get("binary_segmentation", False)
     if not isinstance(binary_segmentation, bool):
         raise ValueError("binary_segmentation must be a boolean in the config file.")
+    exclude_low_score_only_patients = hyperparams.get("exclude_low_score_only_patients", True)
+    if not isinstance(exclude_low_score_only_patients, bool):
+        raise ValueError("exclude_low_score_only_patients must be a boolean in the config file.")
+    hyperparams["exclude_low_score_only_patients"] = exclude_low_score_only_patients
     if class_weight_power is not None and class_weight_power <= 0:
         raise ValueError("class_weight_power must be greater than zero or null.")
     hyperparams["class_weight_power"] = class_weight_power
@@ -238,25 +260,9 @@ def main():
     records = load_records(data_csv)
     if not records:
         raise ValueError(f"No records found in {data_csv}")
-    if binary_segmentation:
-        eligible_primary_scores = {3, 4, 5}
-        filtered_records = [
-            record
-            for record in records
-            if any(lesion.label in eligible_primary_scores for lesion in record.lesions)
-        ]
-        excluded_count = len(records) - len(filtered_records)
-        if excluded_count:
-            print(
-                "[Info] Binary segmentation enabled: excluding "
-                f"{excluded_count} patient(s) without PRIMARY score 3-5 lesions."
-            )
-        records = filtered_records
-        if not records:
-            raise ValueError(
-                "Binary segmentation requires patients with PRIMARY scores 3, 4, or 5. "
-                f"None were found in {data_csv}."
-            )
+    records = select_training_records(
+        records, binary_segmentation, exclude_low_score_only_patients
+    )
 
     # The held-out test set is identical in single-split and k-fold mode for the same seed.
     splits = split_records(
@@ -273,11 +279,10 @@ def main():
     hyperparams["unet"] = unet_kwargs
 
     hyperparams_path = experiment_dir / f"{model_name}_hyperparameters.json"
-    with open(hyperparams_path, "w", encoding="utf-8") as handle:
-        json.dump(hyperparams, handle, indent=2, sort_keys=True)
-    print(f"Hyperparameters saved to {hyperparams_path}")
-
     if k_folds is None:
+        with hyperparams_path.open("w", encoding="utf-8") as handle:
+            json.dump(hyperparams, handle, indent=2, sort_keys=True)
+        print(f"Hyperparameters saved to {hyperparams_path}")
         train_run(
             hyperparams, experiment_dir, artifact_id, records, splits,
             patients_path, data_csv, device, hyperparams_path,
@@ -298,6 +303,17 @@ def main():
         },
     }
     fold_manifest_path = experiment_dir / "folds.json"
+    if fold_manifest_path.exists():
+        with fold_manifest_path.open(encoding="utf-8") as handle:
+            existing_manifest = json.load(handle)
+        if existing_manifest != fold_manifest:
+            raise ValueError(
+                f"Existing fold manifest in {fold_manifest_path} differs from the new splits. "
+                "Choose a new experiment_dir to avoid mixing incompatible fold results."
+            )
+    with hyperparams_path.open("w", encoding="utf-8") as handle:
+        json.dump(hyperparams, handle, indent=2, sort_keys=True)
+    print(f"Hyperparameters saved to {hyperparams_path}")
     with fold_manifest_path.open("w", encoding="utf-8") as handle:
         json.dump(fold_manifest, handle, indent=2)
     print(

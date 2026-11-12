@@ -43,7 +43,7 @@ def parse_args():
         "--example-selection",
         choices=EXAMPLE_SELECTIONS,
         default="spread",
-        help="Which patients to export: spread over the Dice range (default), worst, best, or first.",
+        help="Which patients to export: spread over the binary foreground Dice range (default), worst, best, or first.",
     )
     parser.add_argument(
         "--fold",
@@ -80,11 +80,10 @@ def plot_loss_curves(history_path, output_path):
         history = pickle.load(stream)
 
     loss_groups = (
-        ("total", "Total loss", "Loss"),
         ("segmentation", "Segmentation loss", "Loss"),
         ("dice", "Soft Dice", "Dice"),
     )
-    figure, axes = plt.subplots(1, len(loss_groups), figsize=(15, 4.5), constrained_layout=True)
+    figure, axes = plt.subplots(1, len(loss_groups), figsize=(10, 4.5), constrained_layout=True)
     for axis, (key, title, y_label) in zip(axes, loss_groups):
         plotted = False
         for split, label in (("train", "Train"), ("val", "Validation")):
@@ -110,17 +109,29 @@ def plot_loss_curves(history_path, output_path):
 EXAMPLE_SELECTIONS = ("spread", "worst", "best", "first")
 
 
-def save_visualization_case(output_dir, patient_path, prediction, foreground_probability):
-    """Write the predicted label map and foreground probability with the MRI geometry."""
+def save_visualization_case(output_dir, patient_path, prediction, foreground_probability, target):
+    """Write prediction, evaluation target, and probability on the MRI grid."""
     mri_paths = list(patient_path.rglob("*MRI_T2.nii.gz"))
     if len(mri_paths) != 1:
-        return False
-    output_dir.mkdir(parents=True, exist_ok=True)
+        raise ValueError(
+            f"Visualization export requires exactly one MRI_T2 for {patient_path}; "
+            f"found {len(mri_paths)}."
+        )
     reference_image = itk.imread(mri_paths[0])
-    for array, name in (
+    arrays = (
         (prediction.astype(np.uint8), "prediction.nii.gz"),
+        (target.astype(np.uint8), "target.nii.gz"),
         (foreground_probability.astype(np.float32), "foreground_probability.nii.gz"),
-    ):
+    )
+    expected_shape = tuple(reversed(tuple(itk.size(reference_image))))
+    for array, name in arrays:
+        if array.shape != expected_shape:
+            raise ValueError(
+                f"Cannot export {name} for {patient_path}: shape {array.shape} "
+                f"does not match MRI shape {expected_shape}."
+            )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for array, name in arrays:
         image = itk.image_from_array(np.ascontiguousarray(array))
         image.CopyInformation(reference_image)
         itk.imwrite(image, output_dir / name, compression=True)
@@ -128,7 +139,7 @@ def save_visualization_case(output_dir, patient_path, prediction, foreground_pro
 
 
 def select_example_patients(per_patient_dice, evaluated_ids, num_examples, selection):
-    """Choose which patients to export, ordered by foreground Dice where available."""
+    """Choose which patients to export, ordered by binary foreground Dice where available."""
     if num_examples <= 0:
         return []
     if selection == "first":
@@ -166,6 +177,12 @@ def segmentation_metrics(confusion, labels=SEGMENTATION_LABELS):
         if metrics[label]["dice"] is not None
     ]
     metrics["mean_foreground_dice"] = float(np.mean(foreground_dice)) if foreground_dice else None
+    foreground_true_positive = int(confusion[1:, 1:].sum())
+    foreground_denominator = int(confusion[1:, :].sum() + confusion[:, 1:].sum())
+    metrics["foreground_dice"] = (
+        2 * foreground_true_positive / foreground_denominator
+        if foreground_denominator else None
+    )
     return metrics
 
 
@@ -291,6 +308,8 @@ def evaluate_records(
         dtype=np.int64,
     )
     per_patient_dice = {}
+    per_patient_metrics = {}
+    per_patient_binary_dice = {}
     evaluated_patients = 0
     segmentation_patients = 0
     skipped_patients = 0
@@ -341,9 +360,11 @@ def evaluate_records(
                 minlength=segmentation_classes * segmentation_classes,
             ).reshape(segmentation_classes, segmentation_classes)
             segmentation_confusion += patient_confusion
-            per_patient_dice[str(record.series_id)] = segmentation_metrics(
-                patient_confusion, segmentation_labels
-            )["mean_foreground_dice"]
+            patient_metrics = segmentation_metrics(patient_confusion, segmentation_labels)
+            patient = str(record.series_id)
+            per_patient_metrics[patient] = patient_metrics
+            per_patient_dice[patient] = patient_metrics["mean_foreground_dice"]
+            per_patient_binary_dice[patient] = patient_metrics["foreground_dice"]
             segmentation_patients += 1
         else:
             print(f"[info] patient {record.series_id}: incomplete score 3-5 masks excluded from segmentation metrics")
@@ -354,21 +375,39 @@ def evaluate_records(
     exported_examples = []
     if segmentations_dir is not None:
         selected = select_example_patients(
-            per_patient_dice, list(evaluated_indices), num_examples, example_selection
+            per_patient_binary_dice, list(evaluated_indices), num_examples, example_selection
         )
         for patient in selected:
             # Re-run inference on the few exported patients instead of keeping every volume in memory.
-            _, prediction, probability = predict(dataset[evaluated_indices[patient]])
+            sample = dataset[evaluated_indices[patient]]
+            _, prediction, probability = predict(sample)
+            target_valid = bool(sample["segmentation_valid"])
+            if not target_valid:
+                print(f"[warning] patient {patient}: exported target is incomplete; "
+                      "see target_valid=false in examples.json")
             case_dir = segmentations_dir / f"patient_{patient}"
-            if save_visualization_case(case_dir, data_dir / patient, prediction, probability):
+            if save_visualization_case(
+                case_dir, data_dir / patient, prediction, probability, sample["segmentation"],
+            ):
                 exported_examples.append({
                     "patient_id": patient,
-                    "foreground_dice": per_patient_dice.get(patient),
+                    "foreground_dice": per_patient_binary_dice.get(patient),
+                    "per_class_dice": {
+                        label: per_patient_metrics[patient][label]["dice"]
+                        if patient in per_patient_metrics else None
+                        for label in segmentation_labels
+                    },
+                    "mean_foreground_dice": per_patient_dice.get(patient),
                     "path": str(case_dir),
+                    "target_valid": target_valid,
                 })
         if exported_examples:
             with (segmentations_dir / "examples.json").open("w", encoding="utf-8") as stream:
-                json.dump({"selection": example_selection, "examples": exported_examples}, stream, indent=2)
+                json.dump({
+                    "selection": example_selection,
+                    "class_labels": list(segmentation_labels),
+                    "examples": exported_examples,
+                }, stream, indent=2)
 
     patient_dice_values = [value for value in per_patient_dice.values() if value is not None]
     return {

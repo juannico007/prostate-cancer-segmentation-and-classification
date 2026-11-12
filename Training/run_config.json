@@ -1,6 +1,6 @@
 {
-  "experiment_dir": "results/cropped_prostate/weighting_augmented_with_k_folds/binary_segmentation_5_folds",
-  "data_dir": "Data/cropped_resampled_images",
+  "experiment_dir": "results/resampled_then_cropped_prostate/weighting_augmented_with_k_folds/class_3-5_segmentation_5_folds",
+  "data_dir": "Data/preprocessed_images",
   "data_csv": "Data/data.csv",
   "input_shape": [
     128,
@@ -29,9 +29,10 @@
   },
   "grouped_normalization": false,
   "data_augmentation": true,
-  "binary_segmentation": true,
+  "binary_segmentation": false,
+  "exclude_low_score_only_patients": true,
   "class_weight_power": 0.5,
-  "model_name": "binary_segmentation_5_folds",
+  "model_name": "class_3-5_segmentation_5_folds",
   "model_version": "0.4",
   "split": "train",
   "num_examples": 5,
