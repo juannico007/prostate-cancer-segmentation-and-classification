@@ -3,6 +3,7 @@ cuda-bindings==12.9.7
 cuda-pathfinder==1.6.0
 cuda-toolkit==12.8.1
 cycler==0.12.1
+dicom2nifti==2.5.1
 filelock==3.32.3
 fonttools==4.63.0
 fsspec==2026.7.0
@@ -29,10 +30,12 @@ nvidia-nvjitlink-cu12==12.8.93
 nvidia-nvshmem-cu12==3.4.5
 nvidia-nvtx-cu12==12.8.90
 opencv-python==5.0.0.93
+openpyxl==3.1.5
 packaging==26.3
 pandas==3.0.5
 pillow==12.3.0
 pyparsing==3.3.2
+pydicom==2.4.4
 python-dateutil==2.9.0.post0
 setuptools==78.1.0
 simpleitk==2.5.6
