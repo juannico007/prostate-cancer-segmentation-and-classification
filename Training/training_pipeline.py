@@ -20,12 +20,6 @@ from loss_functions import TrainingLosses
 class LesionRecord:
     lesion_id: int
     label: int
-    x_min: int|None
-    y_min: int|None
-    z_min: int|None
-    x_max: int|None
-    y_max: int|None
-    z_max: int|None
 
 
 @dataclass
@@ -52,20 +46,6 @@ def load_records(data_csv: Path) -> List[Record]:
                 study_id = int(row["study_id"])
                 lesion_id = int(row["lesion_id"])
                 label = int(row["PRIMARY"])
-                if row["x_min"] != "":
-                    x_min = int(row["x_min"])
-                    y_min = int(row["y_min"])
-                    z_min = int(row["z_min"])
-                    x_max = int(row["x_max"])
-                    y_max = int(row["y_max"])
-                    z_max = int(row["z_max"])
-                else:
-                    x_min = None
-                    y_min = None
-                    z_min = None
-                    x_max = None
-                    y_max = None
-                    z_max = None
 
             except (TypeError, ValueError):
                 # Skip rows that look like headers or malformed entries
@@ -76,12 +56,6 @@ def load_records(data_csv: Path) -> List[Record]:
                     LesionRecord(
                         lesion_id=lesion_id,
                         label=label,
-                        x_min=x_min,
-                        y_min=y_min,
-                        z_min=z_min,
-                        x_max=x_max,
-                        y_max=y_max,
-                        z_max=z_max
                     )
                 )
         records = [
@@ -381,62 +355,35 @@ class ProstateDataset(Dataset):
 
         targets = []
         segmentation_target = np.zeros(mri_volume.shape, dtype=np.int64)
-        segmentation_valid = True
+        segmentation_valid = False
 
         for lesion in record.lesions:
-
-            #Checks if the segmentation exists, it does it by looking at the
-            #coordinates of the bounding box, as the coordinates were taken from it
-            has_bbox = all(
-                value is not None
-                for value in (
-                    lesion.x_min,
-                    lesion.y_min,
-                    lesion.z_min,
-                    lesion.x_max,
-                    lesion.y_max,
-                    lesion.z_max,
+            try:
+                mask = self._get_lesion_mask(
+                    patient_path,
+                    lesion.lesion_id
                 )
-            )
-            if has_bbox and lesion.label >= 3:
-                try:
-                    mask = self._get_lesion_mask(
-                        patient_path,
-                        lesion.lesion_id
-                    )
-                except ValueError:
-                    mask = None
-            else:
+            except ValueError:
                 mask = None
 
-            if lesion.label >= 3:
-                if mask is None:
-                    segmentation_valid = False
-                else:
-                    mask_array = np.asarray(mask) > 0
-                    if mask_array.shape != mri_volume.shape:
-                        raise ValueError(
-                            f"Patient {patient}: lesion {lesion.lesion_id} mask shape "
-                            f"{mask_array.shape} does not match image shape {mri_volume.shape}"
-                        )
-                    np.maximum(
-                        segmentation_target,
-                        mask_array.astype(np.int64) * (lesion.label - 2),
-                        out=segmentation_target,
+            if mask is not None:
+                segmentation_valid = True
+                mask_array = np.asarray(mask) > 0
+                if mask_array.shape != mri_volume.shape:
+                    raise ValueError(
+                        f"Patient {patient}: lesion {lesion.lesion_id} mask shape "
+                        f"{mask_array.shape} does not match image shape {mri_volume.shape}"
                     )
+                np.maximum(
+                    segmentation_target,
+                    mask_array.astype(np.int64) * (lesion.label),
+                    out=segmentation_target,
+                )
 
             targets.append({
                 "lesion_id": lesion.lesion_id,
                 "label": lesion.label,
                 "mask": mask,
-                "bbox": np.array([
-                    lesion.z_min,
-                    lesion.y_min,
-                    lesion.x_min,
-                    lesion.z_max,
-                    lesion.y_max,
-                    lesion.x_max,
-                ]) if has_bbox else None,
             })
 
         if self.binary_segmentation:

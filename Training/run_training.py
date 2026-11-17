@@ -38,7 +38,7 @@ def fold_dir_name(fold):
 
 def select_training_records(records, binary_segmentation, exclude_low_score_only_patients):
     """Select the patient cohort before creating any training or evaluation splits."""
-    if not binary_segmentation and not exclude_low_score_only_patients:
+    if not exclude_low_score_only_patients:
         return records
     filtered_records = [
         record for record in records
