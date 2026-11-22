@@ -20,18 +20,38 @@ from loss_functions import TrainingLosses
 class LesionRecord:
     lesion_id: int
     label: int
-    x_min: int|None
-    y_min: int|None
-    z_min: int|None
-    x_max: int|None
-    y_max: int|None
-    z_max: int|None
 
 
 @dataclass
 class Record:
     series_id: int
     lesions: List[LesionRecord]
+
+
+def segmentation_labels(binary_segmentation=False, exclude_low_score_only_patients=False):
+    if binary_segmentation:
+        return ("background", "lesion")
+    first_score = 2 if exclude_low_score_only_patients else 1
+    return ("background",) + tuple(f"score_{score}" for score in range(first_score, 6))
+
+
+def select_training_records(records, binary_segmentation, exclude_low_score_only_patients):
+    """Exclude score-1-only patients while retaining mixed-score patients."""
+    if not exclude_low_score_only_patients:
+        return records
+    filtered_records = [
+        record for record in records
+        if any(lesion.label in {2, 3, 4, 5} for lesion in record.lesions)
+    ]
+    mode = "Binary" if binary_segmentation else "Multiclass"
+    print(
+        f"[Info] {mode} segmentation: excluding {len(records) - len(filtered_records)} "
+        "patient(s) without PRIMARY score 2-5 lesions."
+    )
+    if not filtered_records:
+        raise ValueError(f"{mode} segmentation requires patients with PRIMARY scores 2-5.")
+    return filtered_records
+
 
 def load_records(data_csv: Path) -> List[Record]:
     """Load metadata from CSV into Record objects."""
@@ -52,20 +72,6 @@ def load_records(data_csv: Path) -> List[Record]:
                 study_id = int(row["study_id"])
                 lesion_id = int(row["lesion_id"])
                 label = int(row["PRIMARY"])
-                if row["x_min"] != "":
-                    x_min = int(row["x_min"])
-                    y_min = int(row["y_min"])
-                    z_min = int(row["z_min"])
-                    x_max = int(row["x_max"])
-                    y_max = int(row["y_max"])
-                    z_max = int(row["z_max"])
-                else:
-                    x_min = None
-                    y_min = None
-                    z_min = None
-                    x_max = None
-                    y_max = None
-                    z_max = None
 
             except (TypeError, ValueError):
                 # Skip rows that look like headers or malformed entries
@@ -76,12 +82,6 @@ def load_records(data_csv: Path) -> List[Record]:
                     LesionRecord(
                         lesion_id=lesion_id,
                         label=label,
-                        x_min=x_min,
-                        y_min=y_min,
-                        z_min=z_min,
-                        x_max=x_max,
-                        y_max=y_max,
-                        z_max=z_max
                     )
                 )
         records = [
@@ -124,6 +124,82 @@ def split_records(
         "validation": [record for record in records if record.series_id in validation_ids],
         "test": [record for record in records if record.series_id in test_ids],
     }
+
+
+def kfold_split_records(
+    records: List[Record],
+    k_folds: int,
+    split_seed: int,
+    test_records: Optional[List[Record]] = None,
+) -> List[Dict[str, List[Record]]]:
+    """Split the non-test studies into k folds, stratified by each study's highest lesion label.
+
+    Each returned fold uses one partition for validation and the remaining k-1 for training;
+    the held-out test records are shared by every fold.
+    """
+    if not isinstance(k_folds, int) or k_folds < 2:
+        raise ValueError("k_folds must be an integer greater than or equal to 2.")
+    test_records = list(test_records or [])
+    test_ids = {record.series_id for record in test_records}
+    pool = [record for record in records if record.series_id not in test_ids]
+    pool_ids = sorted({record.series_id for record in pool})
+    if len(pool_ids) < k_folds:
+        raise ValueError(
+            f"Cannot create {k_folds} folds from {len(pool_ids)} non-test studies."
+        )
+
+    strata = defaultdict(list)
+    for record in pool:
+        strata[max((lesion.label for lesion in record.lesions), default=0)].append(record.series_id)
+
+    rng = np.random.default_rng(split_seed)
+    fold_ids: List[set] = [set() for _ in range(k_folds)]
+    offset = 0
+    for stratum in sorted(strata):
+        ids = sorted(set(strata[stratum]))
+        rng.shuffle(ids)
+        for position, series_id in enumerate(ids):
+            fold_ids[(offset + position) % k_folds].add(series_id)
+        offset = (offset + len(ids)) % k_folds
+
+    folds = []
+    for validation_ids in fold_ids:
+        folds.append({
+            "train": [record for record in pool if record.series_id not in validation_ids],
+            "validation": [record for record in pool if record.series_id in validation_ids],
+            "test": test_records,
+        })
+    return folds
+
+
+def summarize_fold_histories(fold_histories: Dict[int, Dict[str, List[float]]]) -> Dict[str, Any]:
+    """Summarize per-fold training curves at the checkpointed (lowest validation loss) epoch."""
+    per_fold = {}
+    for fold, history in sorted(fold_histories.items()):
+        val_total = history.get("val_total") or []
+        if not val_total:
+            continue
+        # Training checkpoints on strict improvement, so the first minimum is the saved epoch.
+        best_index = int(np.argmin(val_total))
+        per_fold[str(fold)] = {
+            "epochs_trained": len(val_total),
+            "best_epoch": best_index + 1,
+            "train_dice_at_best_epoch": float(history["train_dice"][best_index]),
+            "val_dice_at_best_epoch": float(history["val_dice"][best_index]),
+            "val_loss_at_best_epoch": float(val_total[best_index]),
+            "max_val_dice": float(np.max(history["val_dice"])),
+            "final_train_dice": float(history["train_dice"][-1]),
+            "final_val_dice": float(history["val_dice"][-1]),
+        }
+
+    aggregate = {}
+    if per_fold:
+        for key in next(iter(per_fold.values())):
+            if key in {"best_epoch", "epochs_trained"}:
+                continue
+            values = np.array([fold_summary[key] for fold_summary in per_fold.values()])
+            aggregate[key] = {"mean": float(values.mean()), "std": float(values.std(ddof=0))}
+    return {"completed_folds": len(per_fold), "folds": per_fold, "aggregate": aggregate}
 
 
 def write_split_csvs(data_csv: Path, splits: Dict[str, List[Record]], output_dir: Path):
@@ -172,10 +248,14 @@ class ProstateDataset(Dataset):
         records: List[Record],
         normalization_stats: Optional[Dict[str, Dict[str, float]]] = None,
         binary_segmentation: bool = False,
+        exclude_low_score_only_patients: bool = False,
     ):
         self.nii_path = str(nii_path)
         self.records = records
         self.binary_segmentation = binary_segmentation
+        if not isinstance(exclude_low_score_only_patients, bool):
+            raise ValueError("exclude_low_score_only_patients must be a boolean.")
+        self.exclude_low_score_only_patients = exclude_low_score_only_patients
         if normalization_stats is not None:
             validated_stats = {}
             for modality in ("mri", "pet"):
@@ -305,62 +385,38 @@ class ProstateDataset(Dataset):
 
         targets = []
         segmentation_target = np.zeros(mri_volume.shape, dtype=np.int64)
-        segmentation_valid = True
+        segmentation_valid = False
 
         for lesion in record.lesions:
-
-            #Checks if the segmentation exists, it does it by looking at the
-            #coordinates of the bounding box, as the coordinates were taken from it
-            has_bbox = all(
-                value is not None
-                for value in (
-                    lesion.x_min,
-                    lesion.y_min,
-                    lesion.z_min,
-                    lesion.x_max,
-                    lesion.y_max,
-                    lesion.z_max,
+            if lesion.label not in {1, 2, 3, 4, 5}:
+                raise ValueError(f"Patient {patient}: invalid PRIMARY score {lesion.label}.")
+            label = max(0, lesion.label - 1) if self.exclude_low_score_only_patients else lesion.label
+            try:
+                mask = self._get_lesion_mask(
+                    patient_path,
+                    lesion.lesion_id
                 )
-            )
-            if has_bbox and lesion.label >= 3:
-                try:
-                    mask = self._get_lesion_mask(
-                        patient_path,
-                        lesion.lesion_id
-                    )
-                except ValueError:
-                    mask = None
-            else:
+            except ValueError:
                 mask = None
 
-            if lesion.label >= 3:
-                if mask is None:
-                    segmentation_valid = False
-                else:
-                    mask_array = np.asarray(mask) > 0
-                    if mask_array.shape != mri_volume.shape:
-                        raise ValueError(
-                            f"Patient {patient}: lesion {lesion.lesion_id} mask shape "
-                            f"{mask_array.shape} does not match image shape {mri_volume.shape}"
-                        )
-                    np.maximum(
-                        segmentation_target,
-                        mask_array.astype(np.int64) * (lesion.label - 2),
-                        out=segmentation_target,
+            if mask is not None:
+                segmentation_valid = True
+                mask_array = np.asarray(mask) > 0
+                if mask_array.shape != mri_volume.shape:
+                    raise ValueError(
+                        f"Patient {patient}: lesion {lesion.lesion_id} mask shape "
+                        f"{mask_array.shape} does not match image shape {mri_volume.shape}"
                     )
+                np.maximum(
+                    segmentation_target,
+                    mask_array.astype(np.int64) * label,
+                    out=segmentation_target,
+                )
 
             targets.append({
                 "lesion_id": lesion.lesion_id,
                 "label": lesion.label,
                 "mask": mask,
-                "bbox": np.array([
-                    lesion.z_min,
-                    lesion.y_min,
-                    lesion.x_min,
-                    lesion.z_max,
-                    lesion.y_max,
-                    lesion.x_max,
-                ]) if has_bbox else None,
             })
 
         if self.binary_segmentation:
@@ -440,6 +496,7 @@ class TrainingPipeline:
         grouped_normalization: bool = True,
         binary_segmentation: bool = False,
         data_augmentation: bool = True,
+        exclude_low_score_only_patients: bool = False,
         ):
         """
         Initialize training pipeline.
@@ -484,6 +541,11 @@ class TrainingPipeline:
         if binary_segmentation and model.out_channels != 1:
             raise ValueError("Binary segmentation requires a model with out_channels=1.")
         self.binary_segmentation = binary_segmentation
+        if not isinstance(exclude_low_score_only_patients, bool):
+            raise ValueError("exclude_low_score_only_patients must be a boolean.")
+        self.exclude_low_score_only_patients = exclude_low_score_only_patients
+        if exclude_low_score_only_patients and not binary_segmentation and model.out_channels != 5:
+            raise ValueError("Excluding PRIMARY score 1 requires a model with out_channels=5.")
         if not isinstance(data_augmentation, bool):
             raise ValueError("data_augmentation must be a boolean.")
         self.data_augmentation = data_augmentation
@@ -535,6 +597,7 @@ class TrainingPipeline:
             nii_path=nii_path,
             records=records,
             binary_segmentation=self.binary_segmentation,
+            exclude_low_score_only_patients=self.exclude_low_score_only_patients,
         )
 
         if splits is None:
@@ -545,8 +608,12 @@ class TrainingPipeline:
                 test_ratio,
                 split_seed,
             )
-        train_records = splits["train"]
-        val_records = splits["validation"]
+        train_records = select_training_records(
+            splits["train"], self.binary_segmentation, self.exclude_low_score_only_patients
+        )
+        val_records = select_training_records(
+            splits["validation"], self.binary_segmentation, self.exclude_low_score_only_patients
+        )
         missing_train = [r.series_id for r in train_records if not volume_check.has_required_volumes(r)]
         missing_val = [r.series_id for r in val_records if not volume_check.has_required_volumes(r)]
         train_records = [r for r in train_records if r.series_id not in set(missing_train)]
@@ -567,6 +634,7 @@ class TrainingPipeline:
             nii_path=nii_path,
             records=train_records,
             binary_segmentation=self.binary_segmentation,
+            exclude_low_score_only_patients=self.exclude_low_score_only_patients,
         )
         if self.grouped_normalization:
             self.normalization_stats = train_dataset.compute_normalization_stats()
@@ -583,6 +651,7 @@ class TrainingPipeline:
             records=val_records,
             normalization_stats=self.normalization_stats,
             binary_segmentation=self.binary_segmentation,
+            exclude_low_score_only_patients=self.exclude_low_score_only_patients,
         )
 
         train_loader = DataLoader(
@@ -630,6 +699,8 @@ class TrainingPipeline:
             self.losses.segmentation_class_weights.tolist(),
             "from voxel counts:",
             segmentation_counts.tolist(),
+            "for classes:",
+            segmentation_labels(self.binary_segmentation, self.exclude_low_score_only_patients),
             f"({valid_segmentation_patients} valid training masks)",
         )
 

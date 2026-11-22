@@ -1,7 +1,7 @@
 {
-  "experiment_dir": "results/cropped_prostate/weighting_augmented/binary_segment_class_3_5",
-  "data_dir": "Data/cropped_resampled_images",
-  "data_csv": "Data/data.csv",
+  "experiment_dir": "results/New_segmentation/weighting_augmented_with_k_folds/all_class_segmentation_5_folds",
+  "data_dir": "Data/preprocessed_images",
+  "data_csv": "Data/data_with_new_lesions.csv",
   "input_shape": [
     128,
     128,
@@ -22,18 +22,20 @@
   "validation_ratio": 0.15,
   "test_ratio": 0.15,
   "split_seed": 42,
+  "k_folds": 5,
   "lr_reduction_epochs": 10,
   "loss_weights": {
     "segmentation": 1
   },
   "grouped_normalization": false,
   "data_augmentation": true,
-  "binary_segmentation": true,
+  "binary_segmentation": false,
+  "exclude_low_score_only_patients": false,
   "class_weight_power": 0.5,
-  "model_name": "binary_segment_class_3_5",
+  "model_name": "all_class_segmentation_5_folds",
   "model_version": "0.4",
   "split": "train",
-  "num_examples": 20,
+  "num_examples": 5,
   "unet": {
     "activation": "relu",
     "attention": true,
@@ -41,7 +43,7 @@
     "in_channels": 2,
     "n_blocks": 4,
     "normalization": "group4",
-    "out_channels": 4,
+    "out_channels": 6,
     "start_filters": 16,
     "up_mode": "trilinear"
   }
