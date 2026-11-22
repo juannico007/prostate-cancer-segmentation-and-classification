@@ -27,6 +27,32 @@ class Record:
     series_id: int
     lesions: List[LesionRecord]
 
+
+def segmentation_labels(binary_segmentation=False, exclude_low_score_only_patients=False):
+    if binary_segmentation:
+        return ("background", "lesion")
+    first_score = 2 if exclude_low_score_only_patients else 1
+    return ("background",) + tuple(f"score_{score}" for score in range(first_score, 6))
+
+
+def select_training_records(records, binary_segmentation, exclude_low_score_only_patients):
+    """Exclude score-1-only patients while retaining mixed-score patients."""
+    if not exclude_low_score_only_patients:
+        return records
+    filtered_records = [
+        record for record in records
+        if any(lesion.label in {2, 3, 4, 5} for lesion in record.lesions)
+    ]
+    mode = "Binary" if binary_segmentation else "Multiclass"
+    print(
+        f"[Info] {mode} segmentation: excluding {len(records) - len(filtered_records)} "
+        "patient(s) without PRIMARY score 2-5 lesions."
+    )
+    if not filtered_records:
+        raise ValueError(f"{mode} segmentation requires patients with PRIMARY scores 2-5.")
+    return filtered_records
+
+
 def load_records(data_csv: Path) -> List[Record]:
     """Load metadata from CSV into Record objects."""
     grouped = defaultdict(list)
@@ -222,10 +248,14 @@ class ProstateDataset(Dataset):
         records: List[Record],
         normalization_stats: Optional[Dict[str, Dict[str, float]]] = None,
         binary_segmentation: bool = False,
+        exclude_low_score_only_patients: bool = False,
     ):
         self.nii_path = str(nii_path)
         self.records = records
         self.binary_segmentation = binary_segmentation
+        if not isinstance(exclude_low_score_only_patients, bool):
+            raise ValueError("exclude_low_score_only_patients must be a boolean.")
+        self.exclude_low_score_only_patients = exclude_low_score_only_patients
         if normalization_stats is not None:
             validated_stats = {}
             for modality in ("mri", "pet"):
@@ -358,6 +388,9 @@ class ProstateDataset(Dataset):
         segmentation_valid = False
 
         for lesion in record.lesions:
+            if lesion.label not in {1, 2, 3, 4, 5}:
+                raise ValueError(f"Patient {patient}: invalid PRIMARY score {lesion.label}.")
+            label = max(0, lesion.label - 1) if self.exclude_low_score_only_patients else lesion.label
             try:
                 mask = self._get_lesion_mask(
                     patient_path,
@@ -376,7 +409,7 @@ class ProstateDataset(Dataset):
                     )
                 np.maximum(
                     segmentation_target,
-                    mask_array.astype(np.int64) * (lesion.label),
+                    mask_array.astype(np.int64) * label,
                     out=segmentation_target,
                 )
 
@@ -463,6 +496,7 @@ class TrainingPipeline:
         grouped_normalization: bool = True,
         binary_segmentation: bool = False,
         data_augmentation: bool = True,
+        exclude_low_score_only_patients: bool = False,
         ):
         """
         Initialize training pipeline.
@@ -507,6 +541,11 @@ class TrainingPipeline:
         if binary_segmentation and model.out_channels != 1:
             raise ValueError("Binary segmentation requires a model with out_channels=1.")
         self.binary_segmentation = binary_segmentation
+        if not isinstance(exclude_low_score_only_patients, bool):
+            raise ValueError("exclude_low_score_only_patients must be a boolean.")
+        self.exclude_low_score_only_patients = exclude_low_score_only_patients
+        if exclude_low_score_only_patients and not binary_segmentation and model.out_channels != 5:
+            raise ValueError("Excluding PRIMARY score 1 requires a model with out_channels=5.")
         if not isinstance(data_augmentation, bool):
             raise ValueError("data_augmentation must be a boolean.")
         self.data_augmentation = data_augmentation
@@ -558,6 +597,7 @@ class TrainingPipeline:
             nii_path=nii_path,
             records=records,
             binary_segmentation=self.binary_segmentation,
+            exclude_low_score_only_patients=self.exclude_low_score_only_patients,
         )
 
         if splits is None:
@@ -568,8 +608,12 @@ class TrainingPipeline:
                 test_ratio,
                 split_seed,
             )
-        train_records = splits["train"]
-        val_records = splits["validation"]
+        train_records = select_training_records(
+            splits["train"], self.binary_segmentation, self.exclude_low_score_only_patients
+        )
+        val_records = select_training_records(
+            splits["validation"], self.binary_segmentation, self.exclude_low_score_only_patients
+        )
         missing_train = [r.series_id for r in train_records if not volume_check.has_required_volumes(r)]
         missing_val = [r.series_id for r in val_records if not volume_check.has_required_volumes(r)]
         train_records = [r for r in train_records if r.series_id not in set(missing_train)]
@@ -590,6 +634,7 @@ class TrainingPipeline:
             nii_path=nii_path,
             records=train_records,
             binary_segmentation=self.binary_segmentation,
+            exclude_low_score_only_patients=self.exclude_low_score_only_patients,
         )
         if self.grouped_normalization:
             self.normalization_stats = train_dataset.compute_normalization_stats()
@@ -606,6 +651,7 @@ class TrainingPipeline:
             records=val_records,
             normalization_stats=self.normalization_stats,
             binary_segmentation=self.binary_segmentation,
+            exclude_low_score_only_patients=self.exclude_low_score_only_patients,
         )
 
         train_loader = DataLoader(
@@ -653,6 +699,8 @@ class TrainingPipeline:
             self.losses.segmentation_class_weights.tolist(),
             "from voxel counts:",
             segmentation_counts.tolist(),
+            "for classes:",
+            segmentation_labels(self.binary_segmentation, self.exclude_low_score_only_patients),
             f"({valid_segmentation_patients} valid training masks)",
         )
 

@@ -207,6 +207,7 @@ def main():
                 segmentations_dir=split_output_dir / "predicted_segmentations",
                 num_examples=num_examples if split in example_splits else 0,
                 example_selection=args.example_selection,
+                per_class_probability_maps=True,
             )
             metrics = {
                 "checkpoint": str(checkpoint_path),

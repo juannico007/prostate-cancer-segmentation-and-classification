@@ -11,18 +11,23 @@ import itk
 import torch
 
 from model import UNet
-from training_pipeline import ProstateDataset, collate_fn, load_records
+from training_pipeline import (
+    ProstateDataset,
+    collate_fn,
+    load_records,
+    segmentation_labels as get_segmentation_labels,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUN_CONFIG = REPO_ROOT / "Training/run_config.json"
-SEGMENTATION_LABELS = ("background", "score_3", "score_4", "score_5")
+SEGMENTATION_LABELS = ("background", "score_1", "score_2", "score_3", "score_4", "score_5")
 BINARY_SEGMENTATION_LABELS = ("background", "lesion")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate four-class segmentation and save case visualizations."
+        description="Evaluate segmentation and save case visualizations."
     )
     parser.add_argument(
         "--checkpoint",
@@ -109,8 +114,8 @@ def plot_loss_curves(history_path, output_path):
 EXAMPLE_SELECTIONS = ("spread", "worst", "best", "first")
 
 
-def save_visualization_case(output_dir, patient_path, prediction, foreground_probability, target):
-    """Write prediction, evaluation target, and probability on the MRI grid."""
+def save_visualization_case(output_dir, patient_path, prediction, probability_maps, target):
+    """Write prediction, evaluation target, and probability maps on the MRI grid."""
     mri_paths = list(patient_path.rglob("*MRI_T2.nii.gz"))
     if len(mri_paths) != 1:
         raise ValueError(
@@ -118,11 +123,11 @@ def save_visualization_case(output_dir, patient_path, prediction, foreground_pro
             f"found {len(mri_paths)}."
         )
     reference_image = itk.imread(mri_paths[0])
-    arrays = (
+    arrays = [
         (prediction.astype(np.uint8), "prediction.nii.gz"),
         (target.astype(np.uint8), "target.nii.gz"),
-        (foreground_probability.astype(np.float32), "foreground_probability.nii.gz"),
-    )
+        *[(probability.astype(np.float32), name) for name, probability in probability_maps.items()],
+    ]
     expected_shape = tuple(reversed(tuple(itk.size(reference_image))))
     for array, name in arrays:
         if array.shape != expected_shape:
@@ -197,7 +202,11 @@ def load_config(config_path):
         raise FileNotFoundError(f"Run config not found: {config_path}")
     with config_path.open(encoding="utf-8") as stream:
         config = json.load(stream)
-    for key, default in (("grouped_normalization", True), ("binary_segmentation", False)):
+    for key, default in (
+        ("grouped_normalization", True),
+        ("binary_segmentation", False),
+        ("exclude_low_score_only_patients", True),
+    ):
         if not isinstance(config.get(key, default), bool):
             raise ValueError(f"{key} must be a boolean in the config file.")
     return config
@@ -241,6 +250,8 @@ def load_model(config, checkpoint_path, device):
     unet_kwargs = dict(config["unet"])
     if config.get("binary_segmentation", False):
         unet_kwargs["out_channels"] = 1
+    elif config.get("exclude_low_score_only_patients", True):
+        unet_kwargs["out_channels"] = 5
     model = UNet(**unet_kwargs).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     if "model_state_dict" in checkpoint:
@@ -274,6 +285,7 @@ def evaluate_records(
     segmentations_dir=None,
     num_examples=0,
     example_selection="spread",
+    per_class_probability_maps=False,
 ):
     """Run inference on records, accumulate voxel confusion and per-patient Dice, and export examples.
 
@@ -287,14 +299,15 @@ def evaluate_records(
         records,
         normalization_stats=normalization_stats,
         binary_segmentation=binary_segmentation,
+        exclude_low_score_only_patients=config.get("exclude_low_score_only_patients", True),
     )
     if normalization_stats is not None:
         print(f"Using training-set normalization parameters: {normalization_stats}")
     elif not config.get("grouped_normalization", True):
         print("Grouped training-set normalization is disabled.")
 
-    segmentation_labels = (
-        BINARY_SEGMENTATION_LABELS if binary_segmentation else SEGMENTATION_LABELS
+    segmentation_labels = get_segmentation_labels(
+        binary_segmentation, config.get("exclude_low_score_only_patients", True)
     )
     expected_output_channels = 1 if binary_segmentation else len(segmentation_labels)
     if model.out_channels != expected_output_channels:
@@ -315,7 +328,7 @@ def evaluate_records(
     skipped_patients = 0
     evaluated_indices = {}
 
-    def predict(sample):
+    def predict(sample, return_class_probabilities=False):
         batch = collate_fn([sample])
         image = batch["image"].to(device)
         with torch.inference_mode():
@@ -324,11 +337,17 @@ def evaluate_records(
         if binary_segmentation:
             probability = torch.sigmoid(logits)[0, 0]
             prediction = (probability >= 0.5).to(torch.int64)
+            probabilities = (
+                torch.stack((1 - probability, probability))
+                if return_class_probabilities else probability
+            )
         else:
-            probabilities = torch.softmax(logits, dim=1)[0]
-            prediction = probabilities.argmax(dim=0)
-            probability = 1 - probabilities[0]
-        return batch, prediction.cpu().numpy(), probability.cpu().numpy()
+            class_probabilities = torch.softmax(logits, dim=1)[0]
+            prediction = class_probabilities.argmax(dim=0)
+            probabilities = (
+                class_probabilities if return_class_probabilities else 1 - class_probabilities[0]
+            )
+        return batch, prediction.cpu().numpy(), probabilities.cpu().numpy()
 
     for index, record in enumerate(records):
         if not dataset.has_required_volumes(record):
@@ -367,7 +386,7 @@ def evaluate_records(
             per_patient_binary_dice[patient] = patient_metrics["foreground_dice"]
             segmentation_patients += 1
         else:
-            print(f"[info] patient {record.series_id}: incomplete score 3-5 masks excluded from segmentation metrics")
+            print(f"[info] patient {record.series_id}: no valid lesion masks; excluded from segmentation metrics")
 
     if not evaluated_patients:
         raise RuntimeError("No patients with readable MRI and PET volumes were available for evaluation.")
@@ -380,14 +399,21 @@ def evaluate_records(
         for patient in selected:
             # Re-run inference on the few exported patients instead of keeping every volume in memory.
             sample = dataset[evaluated_indices[patient]]
-            _, prediction, probability = predict(sample)
+            _, prediction, probabilities = predict(sample, per_class_probability_maps)
+            if per_class_probability_maps:
+                probability_maps = {
+                    f"{label}_probability.nii.gz": probabilities[index]
+                    for index, label in enumerate(segmentation_labels)
+                }
+            else:
+                probability_maps = {"foreground_probability.nii.gz": probabilities}
             target_valid = bool(sample["segmentation_valid"])
             if not target_valid:
                 print(f"[warning] patient {patient}: exported target is incomplete; "
                       "see target_valid=false in examples.json")
             case_dir = segmentations_dir / f"patient_{patient}"
             if save_visualization_case(
-                case_dir, data_dir / patient, prediction, probability, sample["segmentation"],
+                case_dir, data_dir / patient, prediction, probability_maps, sample["segmentation"],
             ):
                 exported_examples.append({
                     "patient_id": patient,
@@ -494,7 +520,7 @@ def main():
     plot_confusion_matrix(
         np.asarray(metrics["segmentation"]["confusion_matrix"]),
         output_dir / "segmentation_confusion_matrix.png",
-        "Binary voxel segmentation" if binary_segmentation else "Four-class voxel segmentation",
+        "Binary voxel segmentation" if binary_segmentation else "Multiclass voxel segmentation",
         segmentation_labels,
         "segmentation class",
     )

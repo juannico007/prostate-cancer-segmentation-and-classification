@@ -10,6 +10,7 @@ from training_pipeline import (
     TrainingPipeline,
     kfold_split_records,
     load_records,
+    select_training_records,
     split_records,
     summarize_fold_histories,
     write_split_csvs,
@@ -34,24 +35,6 @@ def get_k_folds(hyperparams):
 
 def fold_dir_name(fold):
     return f"fold_{fold}"
-
-
-def select_training_records(records, binary_segmentation, exclude_low_score_only_patients):
-    """Select the patient cohort before creating any training or evaluation splits."""
-    if not exclude_low_score_only_patients:
-        return records
-    filtered_records = [
-        record for record in records
-        if any(lesion.label in {3, 4, 5} for lesion in record.lesions)
-    ]
-    mode = "Binary" if binary_segmentation else "Multiclass"
-    print(
-        f"[Info] {mode} segmentation: excluding {len(records) - len(filtered_records)} "
-        "patient(s) without PRIMARY score 3-5 lesions."
-    )
-    if not filtered_records:
-        raise ValueError(f"{mode} segmentation requires patients with PRIMARY scores 3, 4, or 5.")
-    return filtered_records
 
 
 def train_run(
@@ -105,6 +88,7 @@ def train_run(
         grouped_normalization=hyperparams.get("grouped_normalization", True),
         binary_segmentation=hyperparams.get("binary_segmentation", False),
         data_augmentation=hyperparams.get("data_augmentation", True),
+        exclude_low_score_only_patients=hyperparams["exclude_low_score_only_patients"],
     )
 
     print(f"\n[4/5] Creating Pytorch dataloaders{fold_label}...")
@@ -260,10 +244,6 @@ def main():
     records = load_records(data_csv)
     if not records:
         raise ValueError(f"No records found in {data_csv}")
-    records = select_training_records(
-        records, binary_segmentation, exclude_low_score_only_patients
-    )
-
     # The held-out test set is identical in single-split and k-fold mode for the same seed.
     splits = split_records(
         records,
@@ -276,10 +256,16 @@ def main():
     unet_kwargs = dict(hyperparams.get("unet", {}))
     if binary_segmentation:
         unet_kwargs["out_channels"] = 1
+    elif exclude_low_score_only_patients:
+        unet_kwargs["out_channels"] = 5
     hyperparams["unet"] = unet_kwargs
 
     hyperparams_path = experiment_dir / f"{model_name}_hyperparameters.json"
     if k_folds is None:
+        for split in ("train", "validation"):
+            splits[split] = select_training_records(
+                splits[split], binary_segmentation, exclude_low_score_only_patients
+            )
         with hyperparams_path.open("w", encoding="utf-8") as handle:
             json.dump(hyperparams, handle, indent=2, sort_keys=True)
         print(f"Hyperparameters saved to {hyperparams_path}")
@@ -289,7 +275,15 @@ def main():
         )
         return
 
-    folds = kfold_split_records(records, k_folds, split_seed, test_records=splits["test"])
+    test_ids = {record.series_id for record in splits["test"]}
+    training_pool = select_training_records(
+        [record for record in records if record.series_id not in test_ids],
+        binary_segmentation,
+        exclude_low_score_only_patients,
+    )
+    folds = kfold_split_records(
+        training_pool, k_folds, split_seed, test_records=splits["test"]
+    )
     fold_manifest = {
         "k_folds": k_folds,
         "split_seed": split_seed,
